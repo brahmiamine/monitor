@@ -19,6 +19,10 @@ const ICONS = {
   menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
   close: '<path d="M18 6 6 18M6 6l12 12"/>',
   check: '<path d="M20 6 9 17l-5-5"/>',
+  folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  cpu: '<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9"/><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/>',
+  external: '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+  github: '<path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"/><path d="M9 18c-4.51 2-5-2-7-2"/>',
   alert: '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4M12 17h.01"/>',
 };
 const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ''}</svg>`;
@@ -83,7 +87,7 @@ function monitorState(m) {
 const monitorBadge = (m) => badge(...monitorState(m));
 
 // ---------- État ----------
-const S = { live: null, monitors: [], incidents: [], history: [], hours: 1, page: 'overview', last: 0, detail: null, settings: null };
+const S = { cfg: {}, projects: [], live: null, monitors: [], incidents: [], history: [], hours: 1, page: 'overview', last: 0, detail: null, settings: null };
 const KIND = { http: 'Site HTTP(S)', keyword: 'HTTP + mot-clé', json: 'HTTP + JSON', tcp: 'Port TCP', dns: 'DNS', ping: 'Ping', docker: 'Conteneur Docker', systemd: 'Service système', push: 'Signal de vie', tls: 'Certificat TLS' };
 
 // ---------- Pages ----------
@@ -124,10 +128,48 @@ const PAGES = {
     ${panel('Processus les plus actifs', table(['PID', 'Nom', 'Utilisateur', 'CPU', 'Mémoire', 'État'], (l.processes || []).slice(0, 15).map((p) => `<tr><td>${p.pid}</td><td>${esc(p.name)}</td><td>${esc(p.username || '')}</td><td>${(p.cpu_percent || 0).toFixed(1)} %</td><td>${(p.memory_percent || 0).toFixed(1)} %</td><td>${esc(p.status)}</td></tr>`)), { note: 'Triés par CPU puis mémoire' })}`;
   } },
 
+  projects: { title: 'Projets', desc: 'Vos applications : adresse, dépôt GitHub, état et dernier déploiement.', async render() {
+    const [items, found] = await Promise.all([api('/api/projects'), api('/api/discover')]);
+    S.projects = items;
+    const safe = (u) => (/^https?:\/\//.test(u || '') ? u : '');
+    const link = (href, label, ic) => (safe(href) ? `<a class="button-link" href="${esc(safe(href))}" target="_blank" rel="noopener noreferrer">${icon(ic)} ${label}</a>` : '');
+    const card = (p) => {
+      const m = p.monitors[0], c = p.container_info, d = p.deploy;
+      const rows = [
+        m ? `<div><span>Statut</span><strong>${monitorBadge(m)}</strong></div><div><span>Disponibilité 24 h</span><strong>${m.uptime != null ? m.uptime + ' %' : '—'}${m.latency != null ? ' · ' + Math.round(m.latency) + ' ms' : ''}</strong></div>` : '',
+        m?.tls_days != null ? `<div><span>Certificat HTTPS</span><strong class="${m.tls_days < 14 ? 'bad' : ''}">${m.tls_days} jours</strong></div>` : '',
+        c ? `<div><span>Conteneur ${esc(c.name)}</span><strong>${esc(c.state)} · CPU ${esc(c.cpu)} · ${esc(c.memory.split('/')[0])}</strong></div>` : '',
+        d ? `<div><span>Dernier déploiement</span><strong>${esc(String(d.sha || '').slice(0, 7))} · ${ago(d.at)}</strong></div>` : '',
+      ].join('');
+      return panel(p.name, `${p.description ? `<p class="form-help" style="padding:0 22px">${esc(p.description)}</p>` : ''}<div class="spec-list">${rows || '<div><span>Aucun contrôle ni conteneur rattaché</span><strong>—</strong></div>'}</div><div class="detail-actions" style="padding:0 22px 20px">${link(p.url, 'Ouvrir l’application', 'external')}${link(p.repo_url, 'Dépôt GitHub', 'github')}<button data-edit-project="${p.id}">Modifier</button><button class="danger" data-delete-project="${p.id}">Supprimer</button></div>`, { note: p.url ? p.url.replace(/^https?:\/\//, '') : '' });
+    };
+    const discovered = found.length ? panel('Détectés sur le serveur', table(['Conteneur', 'Image', 'Ports', ''], found.map((f) => `<tr><td><strong>${esc(f.name)}</strong></td><td>${esc(f.image)}</td><td class="log-message">${esc((f.ports || []).join(', ') || '—')}</td><td><button data-adopt="${esc(f.name)}">Ajouter comme projet</button></td></tr>`)), { note: 'Conteneurs qui ne sont rattachés à aucun projet' }) : '';
+    return `<div class="toolbar"><button class="primary" id="add-project">+ Ajouter un projet</button><span class="muted">${items.length} projet(s)</span></div><div class="split-grid">${items.map(card).join('') || '<div class="empty">Aucun projet. Ajoutez le premier, ou choisissez un conteneur détecté ci-dessous.</div>'}</div>${discovered}`;
+  } },
+
+  system: { title: 'Système', desc: 'Toutes les informations disponibles sur le serveur et sa maintenance.', live: true, render() {
+    const y = S.live?.system; if (!y || !y.os) return '<div class="empty">Collecte des informations du serveur en cours…</div>';
+    const spec = (pairs) => `<div class="spec-list">${pairs.filter((p) => p[1] != null && p[1] !== '').map(([k, v]) => `<div><span>${esc(k)}</span><strong>${v}</strong></div>`).join('')}</div>`;
+    const m = y.memory || {}, c = y.cpu || {}, up = y.updates || {};
+    const failed = y.failed_units;
+    const connections = Object.entries(y.connections || {}).map(([k, v]) => `${esc(k.toLowerCase())} ${v}`).join(' · ');
+    const states = Object.entries(y.process_states || {}).map(([k, v]) => `${esc(k)} ${v}`).join(' · ');
+    return `<div class="split-grid">
+    ${panel('Machine', spec([['Nom d’hôte', esc(y.hostname)], ['Système', esc(y.os)], ['Noyau', esc(y.kernel)], ['Architecture', esc(y.arch)], ['Virtualisation', esc(y.virtualization || 'aucune détectée')], ['Fournisseur', esc([y.vendor, y.product].filter(Boolean).join(' · '))], ['Démarré le', stamp(y.boot_time)], ['Fuseau horaire', esc(y.timezone)], ['Horloge synchronisée (NTP)', y.ntp_synchronized == null ? '—' : y.ntp_synchronized ? 'oui' : '<span class="bad">non</span>'], ['Docker', esc(y.docker?.version || 'non détecté')], ['Python (Monitor)', esc(y.python)]]))}
+    ${panel('Processeur', spec([['Modèle', esc(c.model)], ['Cœurs', `${c.logical ?? '—'} logiques${c.physical ? ` · ${c.physical} physiques` : ''}`], ['Fréquence', c.mhz ? `${c.mhz} MHz${c.max_mhz ? ` (max ${c.max_mhz})` : ''}` : null], ['Cache', esc(c.cache)], ['Changements de contexte', c.ctx_switches?.toLocaleString('fr-FR')], ['Interruptions', c.interrupts?.toLocaleString('fr-FR')], ['Charge / cœur', S.live.load_avg ? (S.live.load_avg[0] / (c.logical || 1)).toFixed(2) : null]]))}
+    ${panel('Mémoire', spec([['Total', bytes(m.MemTotal)], ['Disponible', bytes(m.MemAvailable)], ['Cache', bytes(m.Cached)], ['Tampons', bytes(m.Buffers)], ['Slab (noyau)', bytes(m.Slab)], ['Fichiers modifiés (dirty)', bytes(m.Dirty)], ['Swap utilisé', `${bytes((m.SwapTotal || 0) - (m.SwapFree || 0))} / ${bytes(m.SwapTotal)}`], ['Swappiness', esc(y.swappiness)], ['Mémoire engagée', m.Committed_AS ? `${bytes(m.Committed_AS)} / ${bytes(m.CommitLimit)}` : null]]))}
+    ${panel('Processus et ressources du noyau', spec([['Processus', y.processes], ['Threads', y.threads], ['États', states], ['Descripteurs de fichiers', y.file_handles ? `${y.file_handles.allocated.toLocaleString('fr-FR')} / ${y.file_handles.max.toLocaleString('fr-FR')}` : null], ['Entropie disponible', esc(y.entropy)]]))}
+    ${panel('Stockage', `${(y.block_devices || []).map((d) => `<div class="disk-item"><p><strong>/dev/${esc(d.name)}</strong><small>${bytes(d.size)} · ${d.rotational ? 'disque dur' : 'SSD / virtuel'}${d.model ? ' · ' + esc(d.model) : ''}</small></p></div>`).join('')}${(y.inodes || []).map((i) => `<div class="disk-item"><p><strong>Inodes ${esc(i.mount)}</strong><small>${i.used.toLocaleString('fr-FR')} / ${i.total.toLocaleString('fr-FR')} (${i.percent} %)</small></p>${meter(i.percent)}</div>`).join('')}`, { note: 'Disques physiques et inodes (nombre de fichiers possibles)' })}
+    ${panel('Réseau', spec([['Passerelle', esc(y.gateway)], ['Serveurs DNS', esc((y.dns || []).join(', '))], ['Connexions', connections]]) + `<div class="network-list">${(y.interfaces || []).map((n) => `<div class="mini-row"><div><strong>${esc(n.name)}</strong><small>${esc([...n.ipv4, ...n.ipv6].join(' · ') || '—')}</small></div><span class="right">${n.up ? 'actif' : 'inactif'}${n.speed ? ' · ' + n.speed + ' Mb/s' : ''} · MTU ${n.mtu ?? '—'}<br>${esc(n.mac || '')}</span></div>`).join('')}</div>`)}
+    ${panel('Ports en écoute', table(['Protocole', 'Adresse', 'Port'], (y.listening || []).map((p) => `<tr><td>${esc(p.proto)}</td><td>${esc(p.address)}</td><td>${p.port}</td></tr>`), 'Aucun port en écoute visible.'), { note: 'Ce qui accepte des connexions sur ce serveur' })}
+    ${panel('Maintenance et sécurité', spec([['Redémarrage requis', y.reboot_required ? '<span class="bad">oui</span>' : 'non'], ['Mises à jour disponibles', up.count == null ? 'inconnu' : `${up.count}${up.security ? ` · <span class="bad">${up.security} de sécurité</span>` : ''}`], ['Dernière vérification', up.checked ? ago(up.checked) : null], ['Services en échec', failed == null ? 'inconnu' : failed.length ? `<span class="bad">${esc(failed.map((f) => f.name).join(', '))}</span>` : 'aucun'], ['Sessions ouvertes', (y.users || []).length ? esc(y.users.map((u) => `${u.name}@${u.host || 'local'}`).join(', ')) : 'aucune']]))}</div>`;
+  } },
+
   containers: { title: 'Conteneurs', desc: 'Tous les conteneurs Docker et ce qu’ils consomment.', live: true, render() {
     const l = S.live; if (!l?.ts) return '<div class="empty">Chargement…</div>';
     if (l.errors?.containers) return `<div class="notice error">${esc(l.errors.containers)}</div>`;
-    return panel('Conteneurs Docker', table(['Nom', 'Image', 'État', 'Statut', 'CPU', 'Mémoire', 'Réseau', 'Disque'], (l.containers || []).map((c) => `<tr><td><strong>${esc(c.name)}</strong></td><td>${esc(c.image)}</td><td>${badge(c.state === 'running' ? '' : 'down', c.state)}</td><td>${esc(c.status)}</td><td>${esc(c.cpu)}</td><td>${esc(c.memory)}</td><td>${esc(c.network)}</td><td>${esc(c.io)}</td></tr>`), 'Aucun conteneur détecté.'), { note: 'Mesures prises toutes les 10 secondes' });
+    const since = (c) => (c.state === 'running' && c.started ? dur(Date.now() / 1000 - Date.parse(c.started) / 1000) : '—');
+    return panel('Conteneurs Docker', table(['Nom', 'Image', 'État', 'Santé', 'En ligne depuis', 'Redém.', 'Ports', 'CPU', 'Mémoire', 'Réseau', 'Disque'], (l.containers || []).map((c) => `<tr><td><strong>${esc(c.name)}</strong>${c.compose ? `<small>${esc(c.compose)}</small>` : ''}</td><td>${esc(c.image)}</td><td>${badge(c.state === 'running' ? '' : 'down', c.state)}</td><td>${c.health ? badge(c.health === 'healthy' ? '' : 'down', c.health) : '—'}</td><td>${since(c)}</td><td>${c.restarts || 0}${c.oom ? ' · OOM' : ''}</td><td class="log-message">${esc((c.ports || []).join(', ') || '—')}</td><td>${esc(c.cpu)}</td><td>${esc(c.memory)}</td><td>${esc(c.network)}</td><td>${esc(c.io)}</td></tr>`), 'Aucun conteneur détecté.'), { note: 'Mesures prises toutes les 10 secondes' });
   } },
 
   services: { title: 'Services système', desc: 'Services systemd en cours d’exécution sur le serveur.', live: true, render() {
@@ -173,7 +215,6 @@ async function render() {
   const page = PAGES[S.page], content = $('#content');
   try { content.innerHTML = await page.render(); } catch (e) { if (e.message !== 'Connexion requise') content.innerHTML = `<div class="notice error">${esc(e.message)}</div>`; }
   decorate(content);
-  if (S.page === 'overview' || S.page === 'server') $$('[data-icon]', content);
 }
 const liveRender = () => { if (PAGES[S.page].live && !document.activeElement?.closest?.('#content input,#content textarea')) render(); };
 
@@ -229,6 +270,23 @@ function monitorForm(m = {}) {
   };
 }
 
+function projectForm(p = {}) {
+  openDialog(p.id ? 'Modifier le projet' : 'Nouveau projet', `<form id="project-form" class="form-grid">
+    <label class="full">Nom<input name="name" value="${esc(p.name)}" required maxlength="100"></label>
+    <label class="full">Adresse de l’application<input name="url" type="url" value="${esc(p.url)}" placeholder="https://app.exemple.fr"></label>
+    <label class="full">Dépôt GitHub (ou autre)<input name="repo_url" type="url" value="${esc(p.repo_url)}" placeholder="https://github.com/utilisateur/projet"></label>
+    <label>Conteneur Docker<input name="container" value="${esc(p.container)}" placeholder="nom-du-conteneur" pattern="[A-Za-z0-9_.\-]*"></label>
+    <label>Dossier de déploiement (facultatif)<input name="repo_dir" value="${esc(p.repo_dir)}" pattern="[A-Za-z0-9_.\-]*"></label>
+    <label class="full">Description<input name="description" value="${esc(p.description)}" maxlength="500"></label>
+    <p class="error full" id="form-error" role="alert"></p><div class="form-actions full"><button class="primary" type="submit">Enregistrer</button><button type="button" id="cancel">Annuler</button></div></form>`);
+  $('#cancel').onclick = () => $('#dialog').close();
+  $('#project-form').onsubmit = async (ev) => {
+    ev.preventDefault(); const d = Object.fromEntries(new FormData(ev.target));
+    try { await api(p.id ? `/api/projects/${p.id}` : '/api/projects', { method: p.id ? 'PUT' : 'POST', body: d }); $('#dialog').close(); render(); toast('Projet enregistré'); }
+    catch (e) { $('#form-error').textContent = e.message; }
+  };
+}
+
 // ---------- Actions ----------
 document.addEventListener('click', async (ev) => {
   const t = ev.target.closest('button,a'); if (!t) return;
@@ -244,6 +302,10 @@ document.addEventListener('click', async (ev) => {
       else { await api(`/api/monitors/${m.id}/action`, { method: 'POST', body: { action: act, minutes: 60 } }); $('#dialog').close(); toast('Contrôle mis à jour'); setTimeout(async () => { await loadMonitors(); render(); }, 2500); }
     }
     else if (t.id === 'add-monitor') monitorForm();
+    else if (t.id === 'add-project') projectForm();
+    else if (t.dataset.editProject) projectForm(S.projects.find((p) => p.id === +t.dataset.editProject));
+    else if (t.dataset.adopt) projectForm({ name: t.dataset.adopt.replace(/-api$/, ''), container: t.dataset.adopt });
+    else if (t.dataset.deleteProject) { if (t.dataset.confirm) { await api(`/api/projects/${t.dataset.deleteProject}`, { method: 'DELETE' }); render(); toast('Projet supprimé'); } else { t.dataset.confirm = '1'; t.textContent = 'Confirmer'; } }
     else if (t.id === 'test-notify') toast((await api('/api/notifications/test', { method: 'POST' })).message);
   } catch (e) { toast(e.message, true); }
 });
@@ -268,7 +330,13 @@ function connect() {
   source.onmessage = (ev) => { S.live = JSON.parse(ev.data); S.last = Date.now(); $('#stale-banner').hidden = true; $('#connection').lastChild.textContent = ' En direct'; $('#host-label').textContent = S.live.hostname || 'Serveur'; liveRender(); };
   source.onerror = () => { $('#connection').lastChild.textContent = ' Reconnexion…'; };
 }
+function branding(cfg) {
+  const name = cfg.name || 'Serveur';
+  $('#ws-name').textContent = name; $('#ws-crumb').textContent = name; $('#ws-icon').textContent = name[0].toUpperCase();
+  $('#ws-sub').textContent = cfg.database ? 'Base : ' + cfg.database : 'Infrastructure privée'; document.title = 'Monitor · ' + name;
+}
 async function start() {
+  try { S.cfg = await fetch('/api/config').then((r) => r.json()); branding(S.cfg); } catch { /* marque par défaut */ }
   try { S.live = await api('/api/live'); } catch { return showLogin(); }
   $('#login').hidden = true; $('#shell').hidden = false; decorate();
   await loadMonitors(); connect(); await go();

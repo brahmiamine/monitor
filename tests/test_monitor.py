@@ -12,6 +12,19 @@ HEADERS = {'X-Requested-With': 'Monitor'}
 def client():
     os.environ['MONITOR_DATA'] = tempfile.mkdtemp(prefix='monitor-test-')
     os.environ['MONITOR_SECURE_COOKIE'] = '0'
+    if os.environ.get('MONITOR_TEST_DB'):
+        # Base MariaDB de test : repartir de tables vides.
+        os.environ['MONITOR_DB'] = os.environ['MONITOR_TEST_DB']
+        import pymysql
+        from urllib.parse import urlsplit, unquote
+        u = urlsplit(os.environ['MONITOR_DB']); q = dict(x.split('=', 1) for x in u.query.split('&') if '=' in x)
+        conn = pymysql.connect(user=unquote(u.username), password=unquote(u.password or ''), database=u.path.lstrip('/'), unix_socket=unquote(q.get('socket', '')) or None, host=u.hostname or 'localhost')
+        with conn.cursor() as cur:
+            cur.execute('SET FOREIGN_KEY_CHECKS=0'); cur.execute('SHOW TABLES')
+            for (t,) in cur.fetchall(): cur.execute(f'DROP TABLE `{t}`')
+        conn.commit(); conn.close()
+    else:
+        os.environ.pop('MONITOR_DB', None)
     for name in ('engine', 'app'):
         sys.modules.pop(name, None)
     app = importlib.import_module('app')
@@ -54,7 +67,7 @@ def test_default_monitors_are_seeded_once(client):
     login(client)
     monitors = client.get('/api/monitors').json()
     names = {m['name'] for m in monitors}
-    assert {'Subly (abonnements)', 'Civi (test civique)', 'Clubika', 'Conteneur civi-api'} <= names
+    assert 'SSH' in names  # surveillance de départ générique : aucun nom propre à un serveur
     assert len(monitors) == len({m['id'] for m in monitors})
 
 
@@ -107,10 +120,12 @@ def test_public_status_page_only_lists_public_monitors(client):
     login(client)
     settings = client.get('/api/settings').json()
     client.put('/api/settings', json={**settings, 'public_enabled': True, 'telegram_token': '••••••••'}, headers=HEADERS)
+    created = client.post('/api/monitors', json={'name': 'Site public', 'kind': 'tcp', 'target': '127.0.0.1:1', 'public': True}, headers=HEADERS)
+    assert created.status_code == 200
     client.cookies.clear()
     public = client.get('/api/public').json()
-    assert public and all('target' not in m and 'push_token' not in m for m in public)
-    assert 'phpMyAdmin' not in {m['name'] for m in public}  # contrôle non public
+    assert [m['name'] for m in public] == ['Site public']  # SSH et les autres contrôles ne sont pas publics
+    assert all('target' not in m and 'push_token' not in m for m in public)
 
 
 def test_host_collector_publishes_real_measures(client):
@@ -143,3 +158,43 @@ def test_password_change_invalidates_sessions(client):
     assert client.get('/api/monitors').status_code == 401
     client.password = 'un-nouveau-mot-de-passe'
     login(client)
+
+
+def test_projects_crud_validation_and_links(client):
+    login(client)
+    for bad in ({'name': 'x', 'url': 'javascript:alert(1)'}, {'name': 'x', 'repo_url': 'ftp://exemple.fr/r'}, {'name': 'x', 'url': 'https://u:p@exemple.fr'}, {'name': 'x', 'container': 'a b'}, {'name': ''}):
+        assert client.post('/api/projects', json=bad, headers=HEADERS).status_code == 422, bad
+    created = client.post('/api/projects', json={'name': 'Mon app', 'url': 'https://app.exemple.fr', 'repo_url': 'https://github.com/moi/app', 'container': 'app-api', 'repo_dir': 'app'}, headers=HEADERS)
+    assert created.status_code == 200
+    ident = created.json()['id']
+    # Un contrôle sur le même nom d'hôte est rattaché au projet.
+    client.post('/api/monitors', json={'name': 'App HTTP', 'kind': 'http', 'target': 'https://app.exemple.fr/health'}, headers=HEADERS)
+    project = [p for p in client.get('/api/projects').json() if p['id'] == ident][0]
+    assert project['repo_url'] == 'https://github.com/moi/app' and [m['name'] for m in project['monitors']] == ['App HTTP']
+    assert client.put(f'/api/projects/{ident}', json={'name': 'Mon app 2', 'url': 'https://app.exemple.fr'}, headers=HEADERS).status_code == 200
+    assert client.get('/api/discover').status_code == 200
+    assert client.delete(f'/api/projects/{ident}', headers=HEADERS).status_code == 200
+    assert client.delete(f'/api/projects/{ident}', headers=HEADERS).status_code == 404
+
+
+def test_config_is_public_and_generic(client):
+    client.cookies.clear()
+    config = client.get('/api/config').json()
+    assert config['database'] in ('SQLite', 'MariaDB') and config['name']
+    assert 'clubika' not in str(config).lower()
+
+
+def test_system_info_is_collected(client):
+    deadline = time.time() + 20
+    while time.time() < deadline and not client.engine.CACHE.get('system'):
+        time.sleep(0.3)
+    info = client.engine.CACHE['system']
+    assert info['os'] and info['kernel'] and info['cpu']['logical'] and info['memory']['MemTotal'] > 0
+    assert isinstance(info['interfaces'], list) and isinstance(info['listening'], list) and info['processes'] > 0
+    assert 'Environment' not in str(info) and 'password' not in str(info).lower()
+
+
+def test_sql_dialect_translation(client):
+    translate = client.engine.Conn.translate
+    assert translate('INSERT OR REPLACE INTO settings VALUES (?,?)') == 'REPLACE INTO settings VALUES (%s,%s)'
+    assert translate('INSERT OR IGNORE INTO t VALUES (?)') == 'INSERT IGNORE INTO t VALUES (%s)'

@@ -10,7 +10,9 @@ from pydantic import BaseModel, Field, model_validator
 import engine as e
 
 ROOT=Path(__file__).parent
-ORIGIN=os.environ.get('MONITOR_ORIGIN','https://monitor.clubika.com')
+ORIGIN=e.ORIGIN  # vide : l'origine des requêtes doit correspondre à l'hôte demandé (fonctionne derrière n'importe quel nom de domaine)
+DEPLOY_STATE=Path(os.environ.get('MONITOR_DEPLOY_STATE','/opt/monitor/deploy-state'))
+NAME=e.SITE_NAME or socket.gethostname()
 ATTEMPTS={}
 
 def hash_password(password,salt=None):
@@ -22,35 +24,30 @@ def verify_password(password,stored):
     except Exception: return False
 
 def bootstrap():
-    if not e.rows("SELECT key FROM settings WHERE key='password_hash'"):
+    if not e.rows("SELECT `key` FROM settings WHERE `key`='password_hash'"):
         password=secrets.token_urlsafe(24)
         with e.db() as c: c.execute('INSERT INTO settings VALUES (?,?)',('password_hash',json.dumps(hash_password(password))))
         path=e.DATA/'admin-credentials.txt'
         fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
-        with os.fdopen(fd,'w') as f: f.write('URL: '+ORIGIN+'\nUtilisateur: admin\nMot de passe: '+password+'\n')
+        with os.fdopen(fd,'w') as f: f.write('URL: '+(ORIGIN or 'adresse de votre serveur')+'\nUtilisateur: admin\nMot de passe: '+password+'\n')
 
 def seed_monitors():
-    """Premier démarrage : surveille les applications et conteneurs du serveur (modifiable ensuite dans l'interface)."""
+    """Premier démarrage : détecte les conteneurs Docker et le SSH du serveur et les surveille (modifiable ensuite dans l'interface)."""
     if e.rows('SELECT id FROM monitors LIMIT 1'): return
-    http=lambda name,url,**kw:dict(name=name,kind=kw.pop('kind','http'),target=url,group_name='Applications',public=1,**kw)
-    health=lambda name,host:http(name,f'https://{host}/api/health',kind='keyword',keyword='"ok":true')
-    items=[health('Subly (abonnements)','subly.clubika.com'),health('Papertrail (notes)','papertrail.clubika.com'),health('MatchTrip','match.clubika.com'),
-        health('9adhiya (courses)','9adhiya.clubika.com'),health('Civi (test civique)','civi.clubika.com'),http('Clubika','https://clubika.com/'),
-        dict(name='phpMyAdmin',kind='http',target='https://pma.clubika.com/',expected='401',group_name='Hébergement',public=0),
-        dict(name='Serveur web (Caddy)',kind='docker',target='clubika-caddy-1',group_name='Hébergement',public=0),
-        dict(name='MariaDB de clubika',kind='docker',target='clubika-mariadb-1',group_name='Hébergement',public=0),
-        dict(name='Réseau : DNS clubika.com',kind='dns',target='clubika.com',group_name='Hébergement',public=0),
-        dict(name='Certificat clubika.com',kind='tls',target='clubika.com',group_name='Hébergement',public=0,interval=3600)]
-    items+=[dict(name='Conteneur '+c,kind='docker',target=c,group_name='Conteneurs',public=0) for c in ('abonnement-api','editor-api','matches-api','9adhiya-api','civi-api')]
+    items=[dict(name='SSH',kind='tcp',target='127.0.0.1:22',group_name='Hébergement')]
+    try:
+        for line in e.run(['docker','ps','--format','{{.Names}}']).splitlines():
+            if line.strip() and not line.startswith('monitor'): items.append(dict(name='Conteneur '+line.strip(),kind='docker',target=line.strip(),group_name='Conteneurs'))
+    except Exception: pass
     defaults=dict(interval=60,timeout=10,retries=2,keyword='',expected='200-299',public=0)
     with e.db() as c:
         for m in items:
             v={**defaults,**m,'push_token':secrets.token_urlsafe(32),'created':time.time()}
-            c.execute('INSERT INTO monitors('+','.join(v)+') VALUES ('+','.join('?' for _ in v)+')',tuple(v.values()))
+            c.execute('INSERT INTO monitors('+','.join('`'+k+'`' for k in v)+') VALUES ('+','.join('?' for _ in v)+')',tuple(v.values()))
 
 @asynccontextmanager
 async def lifespan(app):
-    threads=e.start(); bootstrap(); seed_monitors()
+    threads=e.start(); e.migrate_from_sqlite(os.environ.get('MONITOR_MIGRATE_FROM','')); bootstrap(); seed_monitors()
     yield
     e.STOP.set()
     for t in threads: t.join(timeout=3)
@@ -60,18 +57,19 @@ app=FastAPI(title='Monitor Clubika',docs_url=None,redoc_url=None,openapi_url=Non
 @app.middleware('http')
 async def security(request,call_next):
     path=request.url.path
-    public=path in ('/','/status','/healthz','/api/login','/api/public') or path.startswith('/static/') or path.startswith('/api/push/')
+    public=path in ('/','/status','/healthz','/api/login','/api/public','/api/config') or path.startswith('/static/') or path.startswith('/api/push/')
     if path.startswith('/api/') and not public:
         token=hashlib.sha256(request.cookies.get('monitor_session','').encode()).hexdigest()
         if not e.rows('SELECT token FROM sessions WHERE token=? AND expires>?',(token,time.time())):
             return JSONResponse({'detail':'Connexion requise'},401)
     if request.method not in ('GET','HEAD','OPTIONS') and not path.startswith('/api/push/'):
-        if request.headers.get('origin') and request.headers['origin']!=ORIGIN:
+        origin=request.headers.get('origin')
+        if origin and (origin!=ORIGIN if ORIGIN else urlsplit(origin).netloc!=request.headers.get('host')):
             return JSONResponse({'detail':'Origine interdite'},403)
         if request.headers.get('x-requested-with')!='Monitor':
             return JSONResponse({'detail':'En-tête de protection requis'},403)
     try: response=await call_next(request)
-    except sqlite3.OperationalError: return JSONResponse({'detail':'Base occupée, veuillez réessayer.'},503)
+    except e.DBError: return JSONResponse({'detail':'Base occupée, veuillez réessayer.'},503)
     response.headers['X-Content-Type-Options']='nosniff'
     response.headers['X-Frame-Options']='DENY'
     response.headers['Referrer-Policy']='no-referrer'
@@ -113,7 +111,7 @@ class Password(BaseModel):
 def password(body:Password):
     if not verify_password(body.current,e.settings()['password_hash']): raise HTTPException(400,'Mot de passe actuel incorrect')
     with e.db() as c:
-        c.execute('UPDATE settings SET value=? WHERE key=?',(json.dumps(hash_password(body.new)),'password_hash'))
+        c.execute('UPDATE settings SET value=? WHERE `key`=?',(json.dumps(hash_password(body.new)),'password_hash'))
         c.execute('DELETE FROM sessions')
     (e.DATA/'admin-credentials.txt').unlink(missing_ok=True)
     return {'ok':True}
@@ -125,7 +123,7 @@ def health():
 
 @app.get('/api/live')
 def live():
-    with e.LOCK: return {**e.LIVE,**e.CACHE,'open_incidents':e.rows('SELECT * FROM incidents WHERE closed IS NULL ORDER BY opened DESC')}
+    with e.LOCK: return {**e.LIVE,**e.CACHE,'open_incidents':e.rows('SELECT * FROM incidents WHERE is_open=1 ORDER BY opened DESC')}
 
 @app.get('/api/stream')
 async def stream(request:Request):
@@ -141,9 +139,9 @@ async def stream(request:Request):
 def history(hours:int=1):
     if hours not in (1,6,24,168,720): raise HTTPException(400,'Période invalide')
     bucket=max(10,int(hours*3600/360))
-    return e.rows('''SELECT CAST(ts/? AS INT)*? AS ts,AVG(cpu) AS cpu,AVG(ram) AS ram,MAX(disk) AS disk,
-     AVG(rx) AS rx,AVG(tx) AS tx,AVG(read) AS read,AVG(write) AS write,AVG(load) AS load FROM samples
-     WHERE ts>? GROUP BY CAST(ts/? AS INT) ORDER BY ts''',(bucket,bucket,time.time()-hours*3600,bucket))
+    return e.rows('''SELECT FLOOR(ts/?)*? AS ts,AVG(cpu) AS cpu,AVG(ram) AS ram,MAX(disk) AS disk,
+     AVG(rx) AS rx,AVG(tx) AS tx,AVG(`read`) AS `read`,AVG(`write`) AS `write`,AVG(`load`) AS `load` FROM samples
+     WHERE ts>? GROUP BY FLOOR(ts/?) ORDER BY ts''',(bucket,bucket,time.time()-hours*3600,bucket))
 
 @app.get('/api/monitors')
 def monitors(): return e.monitors()
@@ -188,7 +186,7 @@ def create_monitor(body:Monitor):
     if len(e.rows('SELECT id FROM monitors'))>=200: raise HTTPException(400,'Limite de 200 contrôles')
     values=body.model_dump(); values['push_token']=secrets.token_urlsafe(32); values['created']=time.time()
     with e.db() as c:
-        keys=','.join(values); marks=','.join('?' for _ in values)
+        keys=','.join('`'+k+'`' for k in values); marks=','.join('?' for _ in values)
         cursor=c.execute(f'INSERT INTO monitors({keys}) VALUES ({marks})',tuple(values.values())); ident=cursor.lastrowid
     e.event('config','Contrôle ajouté : '+body.name)
     return {'id':ident}
@@ -196,7 +194,7 @@ def create_monitor(body:Monitor):
 @app.put('/api/monitors/{ident}')
 def update_monitor(ident:int,body:Monitor):
     required_monitor(ident); values=body.model_dump()
-    with e.db() as c: c.execute('UPDATE monitors SET '+','.join(k+'=?' for k in values)+' WHERE id=?',(*values.values(),ident))
+    with e.db() as c: c.execute('UPDATE monitors SET '+','.join('`'+k+'`=?' for k in values)+' WHERE id=?',(*values.values(),ident))
     with e.LOCK: e.RERUN.add(ident)
     e.TLS_CACHE.clear()
     return {'ok':True}
@@ -206,7 +204,7 @@ def delete_monitor(ident:int):
     m=required_monitor(ident)
     with e.db() as c:
         c.execute('DELETE FROM monitors WHERE id=?',(ident,))
-        c.execute('UPDATE incidents SET closed=? WHERE source IN (?,?) AND closed IS NULL',(time.time(),'monitor:'+str(ident),'tls:'+str(ident)))
+        c.execute('UPDATE incidents SET closed=?,is_open=NULL WHERE source IN (?,?) AND is_open=1',(time.time(),'monitor:'+str(ident),'tls:'+str(ident)))
     e.event('config','Contrôle supprimé : '+m['name']); return {'ok':True}
 
 class Action(BaseModel):
@@ -227,7 +225,7 @@ def monitor_action(ident:int,body:Action):
 def monitor_history(ident:int,hours:int=24):
     required_monitor(ident)
     hours=max(1,min(720,hours)); cutoff=time.time()-hours*3600; bucket=max(60,hours*30)
-    points=e.rows('SELECT CAST(ts/? AS INT)*? AS ts,MIN(ok) AS ok,AVG(latency) AS latency FROM checks WHERE monitor_id=? AND ts>? GROUP BY CAST(ts/? AS INT) ORDER BY ts',(bucket,bucket,ident,cutoff,bucket))
+    points=e.rows('SELECT FLOOR(ts/?)*? AS ts,MIN(ok) AS ok,AVG(latency) AS latency FROM checks WHERE monitor_id=? AND ts>? GROUP BY FLOOR(ts/?) ORDER BY ts',(bucket,bucket,ident,cutoff,bucket))
     recent=e.rows('SELECT * FROM checks WHERE monitor_id=? ORDER BY ts DESC LIMIT 100',(ident,))
     return {'points':points,'recent':recent}
 
@@ -297,12 +295,31 @@ def test_notifications():
 @app.get('/api/export')
 def export():
     # Exports deliberately omit push tokens, credentials, URLs of notification channels and password hashes.
-    ms=e.rows('SELECT name,kind,target,interval,timeout,retries,keyword,expected,group_name,public FROM monitors')
+    ms=e.rows('SELECT name,kind,target,`interval`,timeout,retries,keyword,expected,group_name,public FROM monitors')
     s=e.settings(); safe={k:s[k] for k in ('cpu_limit','ram_limit','disk_limit','sustain_seconds','retention_days','public_enabled')}
-    return Response(json.dumps({'version':1,'monitors':ms,'settings':safe},ensure_ascii=False,indent=2),media_type='application/json',headers={'Content-Disposition':'attachment; filename="monitor-config.json"'})
+    return Response(json.dumps({'version':1,'monitors':ms,'projects':e.rows('SELECT name,url,repo_url,container,repo_dir,description FROM projects'),'settings':safe},ensure_ascii=False,indent=2),media_type='application/json',headers={'Content-Disposition':'attachment; filename="monitor-config.json"'})
+
+def web_url(value):
+    if not value: return ''
+    u=urlsplit(value)
+    if u.scheme not in ('http','https') or not u.hostname or u.username or u.password: raise ValueError('URL http(s) sans identifiants requise')
+    return value
+
+class Project(BaseModel):
+    name:str=Field(min_length=1,max_length=100)
+    url:str=Field(default='',max_length=500)
+    repo_url:str=Field(default='',max_length=500)
+    container:str=Field(default='',max_length=100,pattern=r'^[A-Za-z0-9_.\-]*$')
+    repo_dir:str=Field(default='',max_length=100,pattern=r'^[A-Za-z0-9_.\-]*$')
+    description:str=Field(default='',max_length=500)
+    @model_validator(mode='after')
+    def valid(self):
+        self.name=self.name.strip(); self.url=web_url(self.url.strip()); self.repo_url=web_url(self.repo_url.strip())
+        return self
 
 class Import(BaseModel):
-    monitors:list[Monitor]=Field(max_length=200)
+    monitors:list[Monitor]=Field(default=[],max_length=200)
+    projects:list[Project]=Field(default=[],max_length=200)
 
 @app.post('/api/import')
 def import_monitors(body:Import):
@@ -310,8 +327,12 @@ def import_monitors(body:Import):
     with e.db() as c:
         for m in body.monitors:
             v=m.model_dump(); v.update(push_token=secrets.token_urlsafe(32),created=time.time())
-            c.execute('INSERT INTO monitors('+','.join(v)+') VALUES ('+','.join('?' for _ in v)+')',tuple(v.values()))
-    return {'ok':True,'imported':len(body.monitors)}
+            c.execute('INSERT INTO monitors('+','.join('`'+k+'`' for k in v)+') VALUES ('+','.join('?' for _ in v)+')',tuple(v.values()))
+    with e.db() as c:
+        for p in body.projects:
+            v=p.model_dump(); v['created']=time.time()
+            c.execute('INSERT INTO projects('+','.join(v)+') VALUES ('+','.join('?' for _ in v)+')',tuple(v.values()))
+    return {'ok':True,'imported':len(body.monitors)+len(body.projects)}
 
 @app.get('/api/export/metrics.csv')
 def csv_metrics(hours:int=24):
@@ -322,6 +343,11 @@ def csv_metrics(hours:int=24):
 
 @app.get('/api/backup')
 def backup():
+    if e.MARIA:
+        # Les secrets (mot de passe, jetons) ne sont pas exportés : la base MariaDB se sauvegarde avec mysqldump.
+        data={'version':1,'monitors':e.rows('SELECT * FROM monitors'),'projects':e.rows('SELECT * FROM projects'),'incidents':e.rows('SELECT * FROM incidents ORDER BY opened DESC LIMIT 1000')}
+        for m in data['monitors']: m.pop('push_token',None)
+        return Response(json.dumps(data,ensure_ascii=False,indent=2),media_type='application/json',headers={'Content-Disposition':'attachment; filename="monitor-backup.json"'})
     output=e.DATA/'backup.sqlite'
     with e.db() as c:
         target=sqlite3.connect(output)
@@ -335,6 +361,56 @@ def public_status():
     if not e.settings()['public_enabled']: raise HTTPException(404,'La page publique est désactivée')
     return [{'name':m['name'],'group':m['group_name'],'ok':m['ok'],'paused':m['paused'],
      'maintenance':m['maintenance_until']>time.time(),'latency':m['latency'],'uptime':m['uptime'],'checked_at':m['checked_at']} for m in e.monitors() if m['public']]
+
+@app.get('/api/config')
+def config():
+    return {'name':NAME,'origin':ORIGIN,'database':'MariaDB' if e.MARIA else 'SQLite'}
+
+def deploy_info(key):
+    """Dernier déploiement (optionnel) : fichiers JSON {sha, at} écrits par le script de déploiement automatique."""
+    if not key: return None
+    try: return json.loads((DEPLOY_STATE/(key+'.json')).read_text())
+    except (OSError,ValueError): return None
+
+@app.get('/api/projects')
+def projects():
+    items=e.rows('SELECT * FROM projects ORDER BY name'); ms=e.monitors()
+    with e.LOCK: containers={c['name']:c for c in e.CACHE['containers']}
+    for p in items:
+        host=urlsplit(p['url']).hostname if p['url'] else None
+        linked=[m for m in ms if (host and urlsplit(m['target']).hostname==host) or (p['container'] and m['kind']=='docker' and m['target']==p['container'])]
+        p['monitors']=[{'id':m['id'],'name':m['name'],'ok':m['ok'],'paused':m['paused'],'latency':m['latency'],'uptime':m['uptime'],'tls_days':m['tls_days']} for m in linked]
+        p['container_info']=containers.get(p['container'])
+        p['deploy']=deploy_info(p['repo_dir'] or p['container'])
+    return items
+
+@app.post('/api/projects')
+def create_project(body:Project):
+    if len(e.rows('SELECT id FROM projects'))>=200: raise HTTPException(400,'Limite de 200 projets')
+    with e.db() as c:
+        v=body.model_dump(); v['created']=time.time()
+        ident=c.execute('INSERT INTO projects('+','.join(v)+') VALUES ('+','.join('?' for _ in v)+')',tuple(v.values())).lastrowid
+    e.event('config','Projet ajouté : '+body.name); return {'id':ident}
+
+@app.put('/api/projects/{ident}')
+def update_project(ident:int,body:Project):
+    v=body.model_dump()
+    with e.db() as c:
+        if not c.execute('UPDATE projects SET '+','.join(k+'=?' for k in v)+' WHERE id=?',(*v.values(),ident)).rowcount: raise HTTPException(404,'Projet introuvable')
+    return {'ok':True}
+
+@app.delete('/api/projects/{ident}')
+def delete_project(ident:int):
+    with e.db() as c:
+        if not c.execute('DELETE FROM projects WHERE id=?',(ident,)).rowcount: raise HTTPException(404,'Projet introuvable')
+    return {'ok':True}
+
+@app.get('/api/discover')
+def discover():
+    """Conteneurs non rattachés à un projet : l'administrateur peut les ajouter en un clic (et les compléter avec l'adresse et le dépôt)."""
+    known={p['container'] for p in e.rows('SELECT container FROM projects')}
+    with e.LOCK: containers=list(e.CACHE['containers'])
+    return [{'name':c['name'],'image':c['image'],'state':c['state'],'ports':c['ports'],'compose':c['compose'],'source':c['source']} for c in containers if c['name'] not in known and not c['name'].startswith('monitor')]
 
 @app.get('/')
 def index(): return FileResponse(ROOT/'static/index.html')

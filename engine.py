@@ -8,24 +8,53 @@ import psutil
 log = logging.getLogger('monitor')
 DATA = Path(os.environ.get('MONITOR_DATA', './data'))
 DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+# Base de données : SQLite par défaut (aucune configuration), MariaDB/MySQL si MONITOR_DB est défini :
+#   mysql://utilisateur:motdepasse@hôte:3306/base   ou   mysql://utilisateur:motdepasse@localhost/base?socket=/run/mysqld/mysqld.sock
+DB_URL = os.environ.get('MONITOR_DB', '').strip()
+MARIA = DB_URL.startswith(('mysql://', 'mariadb://'))
 DB = DATA / 'monitor.db'
+if MARIA:
+    import pymysql, pymysql.cursors
+    DBError = (pymysql.err.OperationalError, pymysql.err.InterfaceError)
+else:
+    DBError = (sqlite3.OperationalError,)
 STOP = threading.Event()
 LOCK = threading.Lock()
 LIVE = {}
-CACHE = {'containers': [], 'services': [], 'errors': {}}
+CACHE = {'containers': [], 'services': [], 'system': {}, 'errors': {}}
 HOST_ROOT = os.environ.get('HOST_ROOT', '')  # racine de l'hôte montée en lecture seule (conteneur) ; vide = exécution directe
 CGROUP_SERVICES = Path(os.environ.get('CGROUP_SERVICES', '/sys/fs/cgroup/system.slice'))
 REAL_FS = {'ext2','ext3','ext4','xfs','btrfs','zfs','vfat','f2fs','ntfs','exfat'}
+ORIGIN = os.environ.get('MONITOR_ORIGIN', '')
+SITE_NAME = os.environ.get('MONITOR_NAME', '')
 DEFAULTS = {'cpu_limit': 90, 'ram_limit': 90, 'disk_limit': 90, 'sustain_seconds': 60,
  'retention_days': 30, 'webhook_url': '', 'telegram_token': '', 'telegram_chat': '',
  'smtp_host': '', 'smtp_port': 587, 'smtp_user': '', 'smtp_password': '', 'smtp_from': '', 'smtp_to': '',
  'public_enabled': False, 'maintenance_until': 0}
 
+class Conn:
+    """Connexion uniforme : écrit en SQL SQLite (placeholders ?), traduit pour MariaDB."""
+    def __init__(self, raw): self.raw = raw
+    @staticmethod
+    def translate(sql):
+        return sql.replace('?', '%s').replace('INSERT OR REPLACE', 'REPLACE').replace('INSERT OR IGNORE', 'INSERT IGNORE')
+    def execute(self, sql, args=()):
+        if not MARIA: return self.raw.execute(sql, args)
+        cur = self.raw.cursor(); cur.execute(self.translate(sql), args); return cur
+    def __getattr__(self, name): return getattr(self.raw, name)
+
+def connect():
+    if not MARIA:
+        c = sqlite3.connect(DB, timeout=15); c.row_factory = sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return Conn(c)
+    u = urlsplit(DB_URL); q = dict(x.split('=', 1) for x in u.query.split('&') if '=' in x)
+    from urllib.parse import unquote
+    return Conn(pymysql.connect(user=unquote(u.username or ''), password=unquote(u.password or ''), database=u.path.lstrip('/'),
+        host=u.hostname or 'localhost', port=u.port or 3306, unix_socket=unquote(q.get('socket', '')) or None, charset='utf8mb4',
+        cursorclass=pymysql.cursors.DictCursor, autocommit=False, connect_timeout=10))
+
 @contextlib.contextmanager
 def db():
-    c = sqlite3.connect(DB, timeout=15)
-    c.row_factory = sqlite3.Row
-    c.execute('PRAGMA foreign_keys=ON')
+    c = connect()
     try:
         yield c
         c.commit()
@@ -37,31 +66,73 @@ def db():
 
 def rows(sql, args=()):
     with db() as c:
-        return [dict(r) for r in c.execute(sql, args)]
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
+
+SQLITE_SCHEMA = '''
+CREATE TABLE IF NOT EXISTS settings(`key` TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,target TEXT NOT NULL,
+  `interval` INTEGER NOT NULL DEFAULT 60,timeout INTEGER NOT NULL DEFAULT 10,retries INTEGER NOT NULL DEFAULT 2,
+  keyword TEXT DEFAULT '',expected TEXT DEFAULT '200-299',group_name TEXT DEFAULT 'Applications',public INTEGER DEFAULT 0,
+  paused INTEGER DEFAULT 0,maintenance_until REAL DEFAULT 0,push_token TEXT,created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY,monitor_id INTEGER REFERENCES monitors(id) ON DELETE CASCADE,
+  ts REAL NOT NULL,ok INTEGER NOT NULL,latency REAL,message TEXT,tls_days INTEGER);
+CREATE INDEX IF NOT EXISTS checks_monitor_ts ON checks(monitor_id,ts);
+CREATE TABLE IF NOT EXISTS samples(ts REAL PRIMARY KEY,cpu REAL,ram REAL,disk REAL,rx REAL,tx REAL,`read` REAL,`write` REAL,`load` REAL);
+CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY,source TEXT NOT NULL,title TEXT NOT NULL,message TEXT,
+  opened REAL NOT NULL,closed REAL,acknowledged INTEGER DEFAULT 0,is_open INTEGER);
+CREATE UNIQUE INDEX IF NOT EXISTS incident_open_key ON incidents(source,is_open);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,ts REAL NOT NULL,kind TEXT NOT NULL,message TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,expires REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS heartbeats(monitor_id INTEGER PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE,ts REAL,ok INTEGER,message TEXT);
+CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY,name TEXT NOT NULL,url TEXT DEFAULT '',repo_url TEXT DEFAULT '',
+  container TEXT DEFAULT '',repo_dir TEXT DEFAULT '',description TEXT DEFAULT '',created REAL NOT NULL);
+'''
+MARIA_SCHEMA = [
+ "CREATE TABLE IF NOT EXISTS settings(`key` VARCHAR(64) PRIMARY KEY,value MEDIUMTEXT NOT NULL)",
+ "CREATE TABLE IF NOT EXISTS monitors(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,kind VARCHAR(20) NOT NULL,target VARCHAR(1000) NOT NULL,"
+ "`interval` INT NOT NULL DEFAULT 60,timeout INT NOT NULL DEFAULT 10,retries INT NOT NULL DEFAULT 2,keyword VARCHAR(500) DEFAULT '',expected VARCHAR(100) DEFAULT '200-299',"
+ "group_name VARCHAR(60) DEFAULT 'Applications',public TINYINT DEFAULT 0,paused TINYINT DEFAULT 0,maintenance_until DOUBLE DEFAULT 0,push_token VARCHAR(64),created DOUBLE NOT NULL)",
+ "CREATE TABLE IF NOT EXISTS checks(id BIGINT AUTO_INCREMENT PRIMARY KEY,monitor_id INT NOT NULL,ts DOUBLE NOT NULL,ok TINYINT NOT NULL,latency DOUBLE,message TEXT,tls_days INT,"
+ "KEY checks_monitor_ts(monitor_id,ts),CONSTRAINT checks_monitor_fk FOREIGN KEY(monitor_id) REFERENCES monitors(id) ON DELETE CASCADE)",
+ "CREATE TABLE IF NOT EXISTS samples(ts DOUBLE PRIMARY KEY,cpu DOUBLE,ram DOUBLE,disk DOUBLE,rx DOUBLE,tx DOUBLE,`read` DOUBLE,`write` DOUBLE,`load` DOUBLE)",
+ "CREATE TABLE IF NOT EXISTS incidents(id INT AUTO_INCREMENT PRIMARY KEY,source VARCHAR(190) NOT NULL,title VARCHAR(255) NOT NULL,message TEXT,opened DOUBLE NOT NULL,"
+ "closed DOUBLE NULL,acknowledged TINYINT DEFAULT 0,is_open TINYINT NULL,UNIQUE KEY incident_open_key(source,is_open))",
+ "CREATE TABLE IF NOT EXISTS events(id INT AUTO_INCREMENT PRIMARY KEY,ts DOUBLE NOT NULL,kind VARCHAR(40) NOT NULL,message TEXT NOT NULL,KEY events_ts(ts))",
+ "CREATE TABLE IF NOT EXISTS sessions(token VARCHAR(64) PRIMARY KEY,expires DOUBLE NOT NULL)",
+ "CREATE TABLE IF NOT EXISTS heartbeats(monitor_id INT PRIMARY KEY,ts DOUBLE,ok TINYINT,message TEXT,CONSTRAINT heartbeats_monitor_fk FOREIGN KEY(monitor_id) REFERENCES monitors(id) ON DELETE CASCADE)",
+ "CREATE TABLE IF NOT EXISTS projects(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,url VARCHAR(500) DEFAULT '',repo_url VARCHAR(500) DEFAULT '',"
+ "container VARCHAR(100) DEFAULT '',repo_dir VARCHAR(255) DEFAULT '',description VARCHAR(500) DEFAULT '',created DOUBLE NOT NULL)",
+]
 
 def init():
     with db() as c:
-        c.execute('PRAGMA journal_mode=WAL')
-        c.executescript('''
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,target TEXT NOT NULL,
-          interval INTEGER NOT NULL DEFAULT 60,timeout INTEGER NOT NULL DEFAULT 10,retries INTEGER NOT NULL DEFAULT 2,
-          keyword TEXT DEFAULT '',expected TEXT DEFAULT '200-299',group_name TEXT DEFAULT 'Applications',public INTEGER DEFAULT 0,
-          paused INTEGER DEFAULT 0,maintenance_until REAL DEFAULT 0,push_token TEXT,created REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY,monitor_id INTEGER REFERENCES monitors(id) ON DELETE CASCADE,
-          ts REAL NOT NULL,ok INTEGER NOT NULL,latency REAL,message TEXT,tls_days INTEGER);
-        CREATE INDEX IF NOT EXISTS checks_monitor_ts ON checks(monitor_id,ts);
-        CREATE TABLE IF NOT EXISTS samples(ts REAL PRIMARY KEY,cpu REAL,ram REAL,disk REAL,rx REAL,tx REAL,read REAL,write REAL,load REAL);
-        CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY,source TEXT NOT NULL,title TEXT NOT NULL,message TEXT,
-          opened REAL NOT NULL,closed REAL,acknowledged INTEGER DEFAULT 0);
-        CREATE UNIQUE INDEX IF NOT EXISTS incident_open ON incidents(source) WHERE closed IS NULL;
-        CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,ts REAL NOT NULL,kind TEXT NOT NULL,message TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,expires REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS heartbeats(monitor_id INTEGER PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE,ts REAL,ok INTEGER,message TEXT);
-        ''')
+        if MARIA:
+            for statement in MARIA_SCHEMA: c.execute(statement)
+        else:
+            c.execute('PRAGMA journal_mode=WAL'); c.executescript(SQLITE_SCHEMA)
+            # Bases créées avec la première version : colonne is_open et clé d'unicité des incidents ouverts.
+            if 'is_open' not in {r['name'] for r in c.execute('PRAGMA table_info(incidents)').fetchall()}:
+                c.execute('ALTER TABLE incidents ADD COLUMN is_open INTEGER'); c.execute('UPDATE incidents SET is_open=1 WHERE closed IS NULL')
+                c.execute('CREATE UNIQUE INDEX IF NOT EXISTS incident_open_key ON incidents(source,is_open)')
         for k,v in DEFAULTS.items():
             c.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (k,json.dumps(v)))
-    os.chmod(DB, 0o600)
+    if not MARIA: os.chmod(DB, 0o600)
+
+def migrate_from_sqlite(path):
+    """Une fois, au passage de SQLite à MariaDB : reprend mot de passe, réglages, contrôles, historique et incidents."""
+    if not MARIA or not path or not Path(path).exists(): return False
+    if rows("SELECT `key` FROM settings WHERE `key`='password_hash'"): return False
+    src=sqlite3.connect(f'file:{path}?mode=ro',uri=True); src.row_factory=sqlite3.Row
+    with db() as c:
+        for table in ('settings','monitors','checks','samples','incidents','events','projects','heartbeats'):
+            try: data=src.execute(f'SELECT * FROM {table}').fetchall()
+            except sqlite3.Error: continue
+            for r in data:
+                row=dict(zip(r.keys(),tuple(r)))
+                if table=='incidents' and 'is_open' not in row: row['is_open']=1 if row['closed'] is None else None
+                verb='REPLACE' if table=='settings' else 'INSERT IGNORE'
+                c.execute(f'{verb} INTO {table}('+','.join('`'+k+'`' for k in row)+') VALUES ('+','.join('?' for _ in row)+')',tuple(row.values()))
+    src.close(); event('config','Données reprises depuis SQLite'); return True
 
 def settings():
     return {r['key']:json.loads(r['value']) for r in rows('SELECT * FROM settings')}
@@ -78,7 +149,7 @@ def run(args, timeout=8):
 
 def notify(title, message):
     s = settings()
-    text = f'{title}\n{message}\nhttps://monitor.clubika.com'
+    text = f'{title}\n{message}' + (f'\n{ORIGIN}' if ORIGIN else '')
     import smtplib
     from email.message import EmailMessage
     channels = []
@@ -110,11 +181,11 @@ def notification_worker():
 def incident(source, active, title, message):
     changed = False
     with db() as c:
-        current = c.execute('SELECT id FROM incidents WHERE source=? AND closed IS NULL',(source,)).fetchone()
+        current = c.execute('SELECT id FROM incidents WHERE source=? AND is_open=1',(source,)).fetchone()
         if active and not current:
-            c.execute('INSERT INTO incidents(source,title,message,opened) VALUES (?,?,?,?)',(source,title,message,time.time())); changed=True
+            c.execute('INSERT INTO incidents(source,title,message,opened,is_open) VALUES (?,?,?,?,1)',(source,title,message,time.time())); changed=True
         elif not active and current:
-            c.execute('UPDATE incidents SET closed=? WHERE id=?',(time.time(),current['id'])); changed=True
+            c.execute('UPDATE incidents SET closed=?,is_open=NULL WHERE id=?',(time.time(),current['id'])); changed=True
     if changed:
         event('incident' if active else 'recovery',title)
         try: NOTIFICATIONS.put_nowait((('Incident : ' if active else 'Rétabli : ')+title,message))
@@ -260,15 +331,11 @@ def monitors():
        FROM monitors m LEFT JOIN checks c ON c.id=(SELECT id FROM checks WHERE monitor_id=m.id ORDER BY ts DESC LIMIT 1)
        ORDER BY m.group_name,m.name''',(time.time()-86400,time.time()-86400))
 
-def inventory():
-    while not STOP.is_set():
-        for key,fn in [('containers',collect_docker),('services',collect_services)]:
-            try:
-                value=fn()
-                with LOCK: CACHE[key]=value; CACHE['errors'].pop(key,None)
-            except Exception:
-                with LOCK: CACHE['errors'][key]='Collecte indisponible : vérifier les permissions du service.'
-        STOP.wait(10)
+
+INSPECT = ('{"id":{{json .Id}},"name":{{json .Name}},"labels":{{json .Config.Labels}},"started":{{json .State.StartedAt}},'
+           '"restarts":{{.RestartCount}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},'
+           '"ports":{{json .NetworkSettings.Ports}},"created":{{json .Created}},"policy":{{json .HostConfig.RestartPolicy.Name}},'
+           '"exit":{{.State.ExitCode}},"oom":{{json .State.OOMKilled}}}')
 
 def collect_docker():
     listing=[json.loads(x) for x in run(['docker','ps','-a','--format','{{json .}}']).splitlines() if x]
@@ -277,9 +344,23 @@ def collect_docker():
     if running:
         for line in run(['docker','stats','--no-stream','--format','{{json .}}',*running],15).splitlines():
             r=json.loads(line); stats[r['ID']]=r
-    return [{'name':r['Names'],'image':r['Image'],'state':r['State'],'status':r['Status'],
-       'cpu':stats.get(r['ID'],{}).get('CPUPerc','—'),'memory':stats.get(r['ID'],{}).get('MemUsage','—'),
-       'network':stats.get(r['ID'],{}).get('NetIO','—'),'io':stats.get(r['ID'],{}).get('BlockIO','—')} for r in listing]
+    details={}
+    if listing:
+        try:
+            for line in run(['docker','inspect','--format',INSPECT,*[x['ID'] for x in listing]],15).splitlines():
+                d=json.loads(line); details[d['id'][:12]]=d
+        except Exception: pass
+    result=[]
+    for r in listing:
+        d=details.get(r['ID'][:12],{}); labels=d.get('labels') or {}
+        ports=sorted({f"{b['HostIp'] or '0.0.0.0'}:{b['HostPort']}->{k}" for k,v in (d.get('ports') or {}).items() for b in (v or [])})
+        result.append({'name':r['Names'],'image':r['Image'],'state':r['State'],'status':r['Status'],
+           'cpu':stats.get(r['ID'],{}).get('CPUPerc','—'),'memory':stats.get(r['ID'],{}).get('MemUsage','—'),
+           'network':stats.get(r['ID'],{}).get('NetIO','—'),'io':stats.get(r['ID'],{}).get('BlockIO','—'),
+           'health':d.get('health'),'restarts':d.get('restarts',0),'started':d.get('started'),'created':d.get('created'),
+           'ports':ports,'policy':d.get('policy'),'oom':d.get('oom',False),'exit_code':d.get('exit'),
+           'compose':labels.get('com.docker.compose.project'),'source':labels.get('org.opencontainers.image.source')})
+    return result
 
 def collect_services():
     """Services systemd : `systemctl` d'abord ; à défaut (conteneur), les services en cours lus dans les cgroups."""
@@ -294,6 +375,153 @@ def collect_services():
         parts=line.strip().lstrip('●').split(None,4)
         if len(parts)>=4: result.append(dict(zip(['name','load','active','state','description'],parts)))
     return result
+
+def read_text(path, default=''):
+    try: return Path(path).read_text().strip()
+    except OSError: return default
+
+def cpuinfo():
+    info={}
+    for line in read_text('/proc/cpuinfo').splitlines():
+        if ':' in line:
+            k,_,v=line.partition(':'); info.setdefault(k.strip(),v.strip())
+    return info
+
+def meminfo():
+    wanted=('MemTotal','MemFree','MemAvailable','Buffers','Cached','SwapCached','SwapTotal','SwapFree','Active','Inactive','Dirty','Shmem','Slab','SReclaimable','Mapped','AnonPages','CommitLimit','Committed_AS')
+    result={}
+    for line in read_text('/proc/meminfo').splitlines():
+        k,_,v=line.partition(':')
+        if k in wanted: result[k]=int(v.split()[0])*1024
+    return result
+
+def block_devices():
+    devices=[]
+    for p in sorted(Path('/sys/block').glob('*')):
+        if p.name.startswith(('loop','ram','dm-','sr','fd','zram')): continue
+        try: size=int(read_text(p/'size','0'))*512
+        except ValueError: size=0
+        devices.append({'name':p.name,'size':size,'rotational':read_text(p/'queue/rotational')=='1','model':read_text(p/'device/model') or None,'scheduler':re.sub(r'.*\[(.*)\].*',r'\1',read_text(p/'queue/scheduler')) or None})
+    return devices
+
+def listening_ports():
+    ports=set()
+    try:
+        for c in psutil.net_connections('inet'):
+            if c.status=='LISTEN' and c.laddr: ports.add((('tcp6' if ':' in c.laddr.ip else 'tcp'),c.laddr.ip,c.laddr.port))
+    except (psutil.AccessDenied,OSError): pass
+    return [{'proto':a,'address':b,'port':c} for a,b,c in sorted(ports,key=lambda x:(x[2],x[1]))]
+
+def connection_states():
+    states={}
+    try:
+        for c in psutil.net_connections('inet'): states[c.status]=states.get(c.status,0)+1
+    except (psutil.AccessDenied,OSError): pass
+    return states
+
+def default_gateway():
+    for line in read_text('/proc/net/route').splitlines()[1:]:
+        f=line.split()
+        if len(f)>2 and f[1]=='00000000':
+            try: return socket.inet_ntoa(int(f[2],16).to_bytes(4,'little'))
+            except (ValueError,OverflowError): pass
+    return None
+
+UPDATES={'count':None,'security':None,'checked':0}
+def check_updates():
+    try:
+        lines=[l for l in run(['apt','list','--upgradable'],40).splitlines() if '/' in l]
+        UPDATES.update(count=len(lines),security=sum(1 for l in lines if 'security' in l.split()[0]),checked=time.time())
+    except Exception: UPDATES.update(count=None,security=None,checked=time.time())
+
+def collect_system():
+    """Informations détaillées sur l'hôte, rafraîchies toutes les 30 s (rien de sensible : pas de variables d'environnement)."""
+    ci=cpuinfo(); freq=psutil.cpu_freq(); vm=psutil.virtual_memory()
+    virt=''
+    try: virt=run(['systemd-detect-virt']).strip()
+    except Exception: pass
+    interfaces=[]
+    stats=psutil.net_if_stats()
+    for name,addrs in psutil.net_if_addrs().items():
+        if name=='lo': continue
+        st=stats.get(name)
+        interfaces.append({'name':name,'up':bool(st and st.isup),'speed':st.speed if st else None,'mtu':st.mtu if st else None,
+          'ipv4':[a.address for a in addrs if a.family==socket.AF_INET],'ipv6':[a.address.split('%')[0] for a in addrs if a.family==socket.AF_INET6],
+          'mac':next((a.address for a in addrs if a.family==psutil.AF_LINK),None)})
+    inodes=[]
+    for p in LIVE.get('disks',[]):
+        try:
+            v=os.statvfs((HOST_ROOT+p['mount']) if HOST_ROOT else p['mount'])
+            if v.f_files: inodes.append({'mount':p['mount'],'total':v.f_files,'used':v.f_files-v.f_ffree,'percent':round(100*(v.f_files-v.f_ffree)/v.f_files,1)})
+        except OSError: pass
+    failed=[]
+    try:
+        for line in run(['systemctl','--failed','--no-legend','--plain','--no-pager']).splitlines():
+            parts=line.strip().lstrip('●').split(None,4)
+            if parts: failed.append({'name':parts[0],'description':parts[4] if len(parts)>4 else ''})
+    except Exception: failed=None
+    sync=None
+    try: sync=run(['timedatectl','show','-p','NTPSynchronized','--value']).strip()=='yes'
+    except Exception: pass
+    states={}
+    threads=0
+    for p in psutil.process_iter(['status','num_threads']):
+        try: states[p.info['status']]=states.get(p.info['status'],0)+1; threads+=p.info['num_threads'] or 0
+        except (psutil.NoSuchProcess,psutil.AccessDenied): pass
+    fh=read_text('/proc/sys/fs/file-nr').split()
+    resolvers=[l.split()[1] for l in read_text('/etc/resolv.conf').splitlines() if l.startswith('nameserver') and len(l.split())>1]
+    cs=psutil.cpu_stats()
+    return {
+      'os':host_platform(),'hostname':host_file('/etc/hostname',socket.gethostname()),'arch':platform.machine(),'kernel':platform.release(),
+      'boot_time':psutil.boot_time(),'timezone':read_text('/etc/timezone') or time.tzname[0],'virtualization':virt or None,
+      'vendor':read_text('/sys/class/dmi/id/sys_vendor') or None,'product':read_text('/sys/class/dmi/id/product_name') or None,
+      'cpu':{'model':ci.get('model name') or ci.get('Model') or platform.processor() or None,'physical':psutil.cpu_count(logical=False),'logical':psutil.cpu_count(),
+             'mhz':round(freq.current) if freq else (float(ci['cpu MHz']) if 'cpu MHz' in ci else None),'max_mhz':round(freq.max) if freq and freq.max else None,
+             'cache':ci.get('cache size'),'bogomips':ci.get('bogomips'),'ctx_switches':cs.ctx_switches,'interrupts':cs.interrupts,'syscalls':cs.syscalls},
+      'memory':meminfo(),'swappiness':read_text('/proc/sys/vm/swappiness') or None,
+      'block_devices':block_devices(),'inodes':inodes,
+      'interfaces':interfaces,'listening':listening_ports(),'connections':connection_states(),'gateway':default_gateway(),'dns':resolvers,
+      'process_states':states,'processes':sum(states.values()),'threads':threads or None,
+      'file_handles':{'allocated':int(fh[0]),'max':int(fh[2])} if len(fh)>=3 else None,'entropy':read_text('/proc/sys/kernel/random/entropy_avail') or None,
+      'users':[{'name':u.name,'terminal':u.terminal,'host':u.host,'started':u.started} for u in psutil.users()],
+      'reboot_required':Path('/var/run/reboot-required').exists(),'updates':dict(UPDATES),'failed_units':failed,'ntp_synchronized':sync,
+      'docker':{'version':docker_version()},'python':platform.python_version(),
+    }
+
+DOCKER_VERSION={'value':None,'at':0}
+def docker_version():
+    if time.time()-DOCKER_VERSION['at']>3600:
+        try: DOCKER_VERSION['value']=run(['docker','version','--format','{{.Server.Version}}']).strip()
+        except Exception: DOCKER_VERSION['value']=None
+        DOCKER_VERSION['at']=time.time()
+    return DOCKER_VERSION['value']
+
+def system_alerts(system):
+    failed=system.get('failed_units')
+    if failed is not None:
+        incident('system:failed-units',bool(failed),'Services systemd en échec','; '.join(f['name'] for f in failed) or '')
+    limit=float(settings()['disk_limit'])
+    for i in system.get('inodes',[]):
+        incident('system:inodes:'+i['mount'],i['percent']>=limit,'Inodes : '+i['mount'],f"{i['percent']} % utilisés")
+
+def inventory():
+    system_at=0; updates_at=0
+    while not STOP.is_set():
+        for key,fn in [('containers',collect_docker),('services',collect_services)]:
+            try:
+                value=fn()
+                with LOCK: CACHE[key]=value; CACHE['errors'].pop(key,None)
+            except Exception:
+                with LOCK: CACHE['errors'][key]='Collecte indisponible : vérifier les permissions du service.'
+        if time.time()-system_at>=30:
+            system_at=time.time()
+            try:
+                if time.time()-updates_at>=3600: updates_at=time.time(); threading.Thread(target=check_updates,daemon=True).start()
+                value=collect_system()
+                with LOCK: CACHE['system']=value
+                system_alerts(value)
+            except Exception: log.exception('System info failed')
+        STOP.wait(10)
 
 def collect():
     psutil.cpu_percent(percpu=True)
@@ -331,7 +559,7 @@ def collect():
             with LOCK:
                 LIVE.clear(); LIVE.update(data)
             if now-saved>=10:
-                with db() as c: c.execute('INSERT OR REPLACE INTO samples VALUES (:ts,:cpu,:ram,:disk,:rx,:tx,:read,:write,:load)',sample)
+                with db() as c: c.execute('INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?,?)',tuple(sample[k] for k in ('ts','cpu','ram','disk','rx','tx','read','write','load')))
                 saved=now
                 s=settings(); maintenance=s['maintenance_until']>now
                 for metric in ('cpu','ram','disk'):

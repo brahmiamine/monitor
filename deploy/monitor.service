@@ -7,7 +7,9 @@ Wants=network-online.target
 User=monitor
 Group=monitor
 WorkingDirectory=/opt/monitor/app
-Environment=MONITOR_DATA=/var/lib/monitor MONITOR_ORIGIN=https://monitor.clubika.com DOCKER_HOST=tcp://127.0.0.1:2375 PYTHONUNBUFFERED=1
+Environment=MONITOR_DATA=/var/lib/monitor DOCKER_HOST=tcp://127.0.0.1:2375 PYTHONUNBUFFERED=1
+# Réglages propres au serveur (nom, adresse publique, base MariaDB…) : voir deploy/monitor.env.example
+EnvironmentFile=-/etc/monitor.env
 # L'application n'écoute pas de port : elle expose un socket Unix, relié à Caddy par le conteneur monitor-bridge.
 ExecStartPre=-/bin/rm -f /var/lib/monitor/run/monitor.sock
 ExecStart=/opt/monitor/venv/bin/uvicorn app:app --uds /var/lib/monitor/run/monitor.sock --workers 1 --no-access-log
