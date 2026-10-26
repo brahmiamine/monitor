@@ -404,13 +404,29 @@ def block_devices():
         devices.append({'name':p.name,'size':size,'rotational':read_text(p/'queue/rotational')=='1','model':read_text(p/'device/model') or None,'scheduler':re.sub(r'.*\[(.*)\].*',r'\1',read_text(p/'queue/scheduler')) or None})
     return devices
 
+WELL_KNOWN = {21:'FTP',22:'SSH',25:'SMTP',53:'DNS',67:'DHCP',80:'HTTP',110:'POP3',123:'NTP',143:'IMAP',443:'HTTPS',465:'SMTPS',587:'SMTP (soumission)',993:'IMAPS',995:'POP3S',
+  2019:'Caddy (admin)',2375:'API Docker',3000:'Application web',3306:'MariaDB / MySQL',5432:'PostgreSQL',5672:'RabbitMQ',6379:'Redis',8000:'Application web',8080:'Application web',8443:'HTTPS alternatif',9000:'Application web',11211:'Memcached',27017:'MongoDB'}
+
 def listening_ports():
-    ports=set()
-    try:
-        for c in psutil.net_connections('inet'):
-            if c.status=='LISTEN' and c.laddr: ports.add((('tcp6' if ':' in c.laddr.ip else 'tcp'),c.laddr.ip,c.laddr.port))
-    except (psutil.AccessDenied,OSError): pass
-    return [{'proto':a,'address':b,'port':c} for a,b,c in sorted(ports,key=lambda x:(x[2],x[1]))]
+    """Sockets en écoute (TCP et UDP) : exposition (public/local), service probable et conteneur qui publie le port."""
+    found=set()
+    for kind,proto in (('tcp','tcp'),('udp','udp')):
+        try:
+            for c in psutil.net_connections(kind):
+                if not c.laddr or (kind=='tcp' and c.status!='LISTEN') or c.raddr: continue
+                found.add((proto+('6' if ':' in c.laddr.ip else ''),c.laddr.ip,c.laddr.port))
+        except (psutil.AccessDenied,OSError): pass
+    with LOCK: containers=list(CACHE.get('containers',[]))
+    published={}
+    for ctr in containers:
+        for mapping in ctr.get('ports',[]):
+            m=re.match(r'^(?:\[?([^\]]*)\]?:)?(\d+)->',mapping)
+            if m: published.setdefault(int(m.group(2)),ctr['name'])
+    result=[]
+    for proto,ip,port in sorted(found,key=lambda x:(x[2],x[1],x[0])):
+        local=ip.startswith('127.') or ip=='::1'
+        result.append({'proto':proto,'address':ip,'port':port,'exposure':'local' if local else 'public','service':WELL_KNOWN.get(port),'container':published.get(port)})
+    return result
 
 def connection_states():
     states={}
@@ -433,6 +449,31 @@ def check_updates():
         lines=[l for l in run(['apt','list','--upgradable'],40).splitlines() if '/' in l]
         UPDATES.update(count=len(lines),security=sum(1 for l in lines if 'security' in l.split()[0]),checked=time.time())
     except Exception: UPDATES.update(count=None,security=None,checked=time.time())
+
+def filesystems():
+    result=[]
+    for p in psutil.disk_partitions(all=True):
+        if p.fstype in ('proc','sysfs','cgroup','cgroup2','devpts','mqueue','securityfs','debugfs','tracefs','configfs','fusectl','pstore','bpf','autofs','hugetlbfs','binfmt_misc','nsfs'): continue
+        if p.mountpoint.startswith(('/proc','/sys/','/run/docker/','/var/lib/docker/','/run/user')) and p.fstype!='tmpfs': continue
+        try: u=psutil.disk_usage((HOST_ROOT+p.mountpoint) if HOST_ROOT else p.mountpoint)
+        except OSError: continue
+        if not u.total: continue
+        result.append({'mount':p.mountpoint,'device':p.device,'fstype':p.fstype,'options':p.opts,'total':u.total,'used':u.used,'percent':u.percent})
+    return result[:40]
+
+IO_PREV={}
+def disk_io():
+    result=[]; now=time.time()
+    try: counters=psutil.disk_io_counters(perdisk=True)
+    except Exception: return result
+    for name,c in counters.items():
+        if name.startswith(('loop','ram','dm-')) or not (c.read_count or c.write_count): continue
+        prev=IO_PREV.get(name); IO_PREV[name]=(now,c)
+        rate=lambda a,b,t:round((a-b)/t,1) if prev and t>0 else None
+        t=now-prev[0] if prev else 0
+        result.append({'name':name,'reads':c.read_count,'writes':c.write_count,'read_bytes':c.read_bytes,'write_bytes':c.write_bytes,
+          'busy_ms':getattr(c,'busy_time',None),'iops':rate(c.read_count+c.write_count,prev[1].read_count+prev[1].write_count,t) if prev else None})
+    return result
 
 def collect_system():
     """Informations détaillées sur l'hôte, rafraîchies toutes les 30 s (rien de sensible : pas de variables d'environnement)."""
@@ -479,7 +520,7 @@ def collect_system():
              'mhz':round(freq.current) if freq else (float(ci['cpu MHz']) if 'cpu MHz' in ci else None),'max_mhz':round(freq.max) if freq and freq.max else None,
              'cache':ci.get('cache size'),'bogomips':ci.get('bogomips'),'ctx_switches':cs.ctx_switches,'interrupts':cs.interrupts,'syscalls':cs.syscalls},
       'memory':meminfo(),'swappiness':read_text('/proc/sys/vm/swappiness') or None,
-      'block_devices':block_devices(),'inodes':inodes,
+      'block_devices':block_devices(),'inodes':inodes,'filesystems':filesystems(),'disk_io':disk_io(),
       'interfaces':interfaces,'listening':listening_ports(),'connections':connection_states(),'gateway':default_gateway(),'dns':resolvers,
       'process_states':states,'processes':sum(states.values()),'threads':threads or None,
       'file_handles':{'allocated':int(fh[0]),'max':int(fh[2])} if len(fh)>=3 else None,'entropy':read_text('/proc/sys/kernel/random/entropy_avail') or None,
@@ -487,6 +528,51 @@ def collect_system():
       'reboot_required':Path('/var/run/reboot-required').exists(),'updates':dict(UPDATES),'failed_units':failed,'ntp_synchronized':sync,
       'docker':{'version':docker_version()},'python':platform.python_version(),
     }
+
+SOFTWARE={'packages':[],'runtimes':[],'docker_images':[],'docker_volumes':[],'checked':0,'error':None}
+RUNTIMES=[('Python','python3',['--version']),('Node.js','node',['--version']),('npm','npm',['--version']),('Java','java',['-version']),('Go','go',['version']),
+  ('PHP','php',['--version']),('Ruby','ruby',['--version']),('Rust','rustc',['--version']),('Git','git',['--version']),('Docker CLI','docker',['--version']),
+  ('Docker Compose','docker',['compose','version']),('MariaDB','mariadbd',['--version']),('MySQL','mysqld',['--version']),('PostgreSQL','postgres',['--version']),
+  ('Redis','redis-server',['--version']),('Nginx','nginx',['-v']),('Apache','apache2',['-v']),('OpenSSL','openssl',['version']),('curl','curl',['--version']),
+  ('GCC','gcc',['--version']),('Make','make',['--version']),('OpenSSH','ssh',['-V']),('systemd','systemctl',['--version']),('Certbot','certbot',['--version'])]
+
+def parse_dpkg(output, manual=(), upgradable=()):
+    """Sortie de `dpkg-query -W -f='${binary:Package}\\t${Version}\\t${Installed-Size}\\t${Status}\\n'` -> liste de paquets installés."""
+    packages=[]
+    for line in output.splitlines():
+        parts=line.split('\t')
+        if len(parts)<4 or not parts[3].endswith(' installed'): continue
+        name=parts[0]; base=name.split(':')[0]
+        packages.append({'name':name,'version':parts[1],'size_kb':int(parts[2] or 0),'manual':base in manual,'upgradable':base in upgradable})
+    return sorted(packages,key=lambda p:p['name'])
+
+def collect_software():
+    """Inventaire des logiciels (toutes les heures) : paquets système, environnements d'exécution, images et volumes Docker."""
+    import shutil
+    result={'packages':[],'runtimes':[],'docker_images':[],'docker_volumes':[],'checked':time.time(),'error':None}
+    try:
+        manual=set(run(['apt-mark','showmanual'],20).split())
+        try: upgradable={l.split('/')[0] for l in run(['apt','list','--upgradable'],40).splitlines() if '/' in l}
+        except Exception: upgradable=set()
+        out=run(['dpkg-query','-W','-f','${binary:Package}\t${Version}\t${Installed-Size}\t${Status}\n'],20)
+        result['packages']=parse_dpkg(out,manual,upgradable)
+    except Exception: result['error']='Liste des paquets indisponible (gestionnaire de paquets Debian/Ubuntu requis).'
+    for label,command,args in RUNTIMES:
+        path=shutil.which(command)
+        if not path: continue
+        try:
+            p=subprocess.run([path,*args],text=True,capture_output=True,timeout=4,env={**os.environ,'LC_ALL':'C'})
+            text=((p.stdout or '')+(p.stderr or '')).strip().splitlines()
+            version=text[0][:120] if text else ''
+        except Exception: version=''
+        result['runtimes'].append({'name':label,'command':command,'path':path,'version':version})
+    try:
+        for line in run(['docker','images','--format','{{json .}}'],15).splitlines():
+            if line.strip(): d=json.loads(line); result['docker_images'].append({'repository':d['Repository'],'tag':d['Tag'],'id':d['ID'],'size':d['Size'],'created':d['CreatedSince']})
+    except Exception: pass
+    try: result['docker_volumes']=[l.strip() for l in run(['docker','volume','ls','-q'],10).splitlines() if l.strip()]
+    except Exception: pass
+    return result
 
 DOCKER_VERSION={'value':None,'at':0}
 def docker_version():
@@ -516,7 +602,12 @@ def inventory():
         if time.time()-system_at>=30:
             system_at=time.time()
             try:
-                if time.time()-updates_at>=3600: updates_at=time.time(); threading.Thread(target=check_updates,daemon=True).start()
+                if time.time()-updates_at>=3600:
+                    updates_at=time.time(); threading.Thread(target=check_updates,daemon=True).start()
+                    def refresh_software():
+                        try: SOFTWARE.update(collect_software())
+                        except Exception: log.exception('Software inventory failed')
+                    threading.Thread(target=refresh_software,daemon=True).start()
                 value=collect_system()
                 with LOCK: CACHE['system']=value
                 system_alerts(value)

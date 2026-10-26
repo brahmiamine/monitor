@@ -198,3 +198,33 @@ def test_sql_dialect_translation(client):
     translate = client.engine.Conn.translate
     assert translate('INSERT OR REPLACE INTO settings VALUES (?,?)') == 'REPLACE INTO settings VALUES (%s,%s)'
     assert translate('INSERT OR IGNORE INTO t VALUES (?)') == 'INSERT IGNORE INTO t VALUES (%s)'
+
+
+def test_dpkg_parser_marks_manual_and_upgradable(client):
+    out = 'bash\t5.2-1\t1500\tinstall ok installed\nlibfoo:amd64\t1.0\t20\tinstall ok installed\nremoved\t1\t5\tdeinstall ok config-files\nvim\t9.0\t3000\tinstall ok installed\n'
+    packages = client.engine.parse_dpkg(out, manual={'bash', 'vim'}, upgradable={'vim'})
+    assert [p['name'] for p in packages] == ['bash', 'libfoo:amd64', 'vim']  # le paquet désinstallé est ignoré
+    by = {p['name']: p for p in packages}
+    assert by['bash']['manual'] and not by['libfoo:amd64']['manual'] and by['vim']['upgradable'] and not by['bash']['upgradable']
+    assert by['bash']['size_kb'] == 1500
+
+
+def test_software_and_ports_endpoints(client):
+    client.cookies.clear()
+    assert client.get('/api/software').status_code == 401
+    login(client)
+    data = client.get('/api/software').json()
+    assert {'packages', 'runtimes', 'docker_images', 'docker_volumes', 'updates'} <= set(data)
+    ports = client.engine.listening_ports()
+    assert isinstance(ports, list)
+    for p in ports:
+        assert p['exposure'] in ('local', 'public') and 0 < p['port'] < 65536 and p['proto'] in ('tcp', 'tcp6', 'udp', 'udp6')
+
+
+def test_system_info_has_storage_and_network_details(client):
+    deadline = time.time() + 20
+    while time.time() < deadline and not client.engine.CACHE.get('system', {}).get('filesystems'):
+        time.sleep(0.3)
+    info = client.engine.CACHE['system']
+    assert info['filesystems'] and all({'mount', 'fstype', 'total', 'percent'} <= set(f) for f in info['filesystems'])
+    assert isinstance(info['disk_io'], list) and isinstance(info['block_devices'], list)

@@ -362,6 +362,11 @@ def public_status():
     return [{'name':m['name'],'group':m['group_name'],'ok':m['ok'],'paused':m['paused'],
      'maintenance':m['maintenance_until']>time.time(),'latency':m['latency'],'uptime':m['uptime'],'checked_at':m['checked_at']} for m in e.monitors() if m['public']]
 
+@app.get('/api/software')
+def software():
+    """Paquets installés, environnements d'exécution, images Docker (liste volumineuse : hors du flux temps réel)."""
+    return {**e.SOFTWARE,'updates':e.UPDATES}
+
 @app.get('/api/config')
 def config():
     return {'name':NAME,'origin':ORIGIN,'database':'MariaDB' if e.MARIA else 'SQLite'}
