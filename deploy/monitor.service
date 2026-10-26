@@ -1,0 +1,30 @@
+[Unit]
+Description=Monitor Clubika (supervision du serveur, des conteneurs et des applications)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=monitor
+Group=monitor
+WorkingDirectory=/opt/monitor/app
+Environment=MONITOR_DATA=/var/lib/monitor MONITOR_ORIGIN=https://monitor.clubika.com DOCKER_HOST=tcp://127.0.0.1:2375 PYTHONUNBUFFERED=1
+# L'application n'écoute pas de port : elle expose un socket Unix, relié à Caddy par le conteneur monitor-bridge.
+ExecStartPre=-/bin/rm -f /var/lib/monitor/run/monitor.sock
+ExecStart=/opt/monitor/venv/bin/uvicorn app:app --uds /var/lib/monitor/run/monitor.sock --workers 1 --no-access-log
+Restart=always
+RestartSec=3
+UMask=0022
+# Utilisateur système dédié, sans sudo ni groupe docker, et un service cloisonné.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/monitor
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+
+[Install]
+WantedBy=multi-user.target
