@@ -269,3 +269,23 @@ def test_project_link_sla_and_database(client):
     assert client.get('/api/sla?days=30').json()['days']==30
     assert client.get('/api/sla?days=3').status_code==422
     assert client.get('/api/containers/unknown-name/logs').status_code==404
+
+def test_sqlite_scheduled_backup(client):
+    import importlib, sqlite3
+    e=client.engine
+    if e.MARIA: pytest.skip('SQLite-specific test')
+    backup=importlib.import_module('backup_util')
+    p=backup.backup()
+    assert p.exists() and p.stat().st_size>100
+    assert p.stat().st_mode & 0o077==0
+    with sqlite3.connect(p) as c:
+        assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+        assert c.execute('SELECT COUNT(*) FROM monitors').fetchone()[0]>=1
+
+
+def test_external_watchdog_reports_a_down_server(monkeypatch):
+    import importlib, urllib.error
+    module=importlib.import_module('tools.external_watch')
+    def offline(*args,**kwargs): raise urllib.error.URLError('offline')
+    monkeypatch.setattr(module.urllib.request,'urlopen',offline)
+    assert module.check('https://monitor.example.com/healthz') is False
