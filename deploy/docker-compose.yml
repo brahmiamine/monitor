@@ -30,4 +30,5 @@ services:
 
 networks:
   monitor_proxy:
+    external: true
     name: ${MONITOR_PROXY_NETWORK:-monitor_proxy}

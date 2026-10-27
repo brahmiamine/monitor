@@ -17,6 +17,13 @@ sudo cp "$REPO/deploy/monitor.service" /etc/systemd/system/monitor.service
 sudo cp "$REPO/deploy/monitor-backup.service" /etc/systemd/system/monitor-backup.service
 sudo cp "$REPO/deploy/monitor-backup.timer" /etc/systemd/system/monitor-backup.timer
 sudo systemctl daemon-reload
+# Preserve an existing monitor-bridge network during upgrades to avoid disconnecting Caddy.
+# Fresh servers receive a dedicated network; the reverse proxy can join it explicitly.
+if [ -z "${MONITOR_PROXY_NETWORK:-}" ]; then
+  EXISTING_NETWORK="$(docker inspect monitor-bridge --format '{{range $name, $network := .NetworkSettings.Networks}}{{println $name}}{{end}}' 2>/dev/null | head -n 1 || true)"
+  export MONITOR_PROXY_NETWORK="${EXISTING_NETWORK:-monitor_proxy}"
+fi
+docker network inspect "$MONITOR_PROXY_NETWORK" >/dev/null 2>&1 || docker network create "$MONITOR_PROXY_NETWORK" >/dev/null
 (cd "$REPO/deploy" && docker compose up -d)
 sudo systemctl enable --now monitor.service
 sudo systemctl enable --now monitor-backup.timer

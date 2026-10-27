@@ -41,7 +41,7 @@ Accès réservé à un administrateur : mot de passe haché (PBKDF2), session pa
 - `monitor-docker-proxy` : liste des conteneurs, images, volumes et statistiques **en lecture seule**, publiée uniquement sur `127.0.0.1` ;
 - `monitor-bridge` : relie Caddy au socket Unix de l'application.
 
-Le reverse proxy (Caddy, Traefik, Nginx…) se connecte au réseau Docker `${MONITOR_PROXY_NETWORK:-monitor_proxy}` (créé automatiquement par Compose) et transmet vers `monitor-bridge:8000`. Exemple pour Caddy dans un autre conteneur : `docker network connect monitor_proxy NOM_DU_CONTENEUR_CADDY`, puis `reverse_proxy monitor-bridge:8000`. **L'installation ne suppose plus de réseau `clubika_internal`**, de domaine ou de conteneur de proxy prédéfini. Ce raccordement au proxy reste une étape à configurer selon le serveur. Mises à jour : `deploy/update.sh` (copie, dépendances, redémarrage, test de santé) ; le déploiement automatique du serveur l'exécute à chaque commit sur `main`.
+Le reverse proxy (Caddy, Traefik, Nginx…) se connecte au réseau Docker `monitor_proxy` par défaut (créé automatiquement par `deploy/install.sh`) et transmet vers `monitor-bridge:8000`. Exemple pour Caddy dans un autre conteneur : `docker network connect monitor_proxy NOM_DU_CONTENEUR_CADDY`, puis `reverse_proxy monitor-bridge:8000`. **L'installation ne suppose plus de réseau `clubika_internal`**, de domaine ou de conteneur de proxy prédéfini. Ce raccordement au proxy reste une étape à configurer selon le serveur. Mises à jour : `deploy/update.sh` (copie, dépendances, redémarrage, test de santé) ; le déploiement automatique du serveur l'exécute à chaque commit sur `main`.
 
 ## Développement
 
@@ -74,4 +74,4 @@ Pour détecter un VPS complètement arrêté, faire exécuter `tools/external_wa
 
 ## Portabilité
 
-Nécessite Linux, systemd, Docker et Python. L'application ne dépend pas d'OVH ni d'un domaine particulier. Le réseau Docker de la passerelle est créé automatiquement (`monitor_proxy`, ou `MONITOR_PROXY_NETWORK` lors de la commande Docker Compose). Brancher explicitement le conteneur du reverse proxy sur ce réseau et router vers `monitor-bridge:8000`. L'hébergement HTTPS et son domaine restent à configurer selon le serveur.
+Nécessite Linux, systemd, Docker et Python. L'application ne dépend pas d'OVH ni d'un domaine particulier. Le réseau Docker de la passerelle est créé automatiquement par `deploy/install.sh` (`monitor_proxy` ou `MONITOR_PROXY_NETWORK`). Sur une installation existante, le script conserve le réseau actuel de `monitor-bridge` pour éviter de déconnecter Caddy. Lancer Compose manuellement nécessite de créer le réseau externe au préalable. Brancher explicitement le conteneur du reverse proxy sur ce réseau et router vers `monitor-bridge:8000`. L'hébergement HTTPS et son domaine restent à configurer selon le serveur.
