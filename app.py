@@ -557,6 +557,8 @@ def discover():
 
 @app.get('/')
 def index(): return FileResponse(ROOT/'static/index.html')
+@app.get('/favicon.ico')
+def favicon(): return FileResponse(ROOT/'static/favicon.ico',media_type='image/x-icon')
 @app.get('/sw.js')
 def service_worker(): return FileResponse(ROOT/'static/sw.js',media_type='application/javascript',headers={'Service-Worker-Allowed':'/'})
 
