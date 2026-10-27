@@ -22,6 +22,8 @@ STOP = threading.Event()
 LOCK = threading.Lock()
 LIVE = {}
 CACHE = {'containers': [], 'services': [], 'system': {}, 'errors': {}}
+INVENTORY_RUNTIME = None
+INVENTORY_STORE = None
 HOST_ROOT = os.environ.get('HOST_ROOT', '')  # racine de l'hôte montée en lecture seule (conteneur) ; vide = exécution directe
 CGROUP_SERVICES = Path(os.environ.get('CGROUP_SERVICES', '/sys/fs/cgroup/system.slice'))
 REAL_FS = {'ext2','ext3','ext4','xfs','btrfs','zfs','vfat','f2fs','ntfs','exfat'}
@@ -50,7 +52,7 @@ def connect():
     from urllib.parse import unquote
     return Conn(pymysql.connect(user=unquote(u.username or ''), password=unquote(u.password or ''), database=u.path.lstrip('/'),
         host=u.hostname or 'localhost', port=u.port or 3306, unix_socket=unquote(q.get('socket', '')) or None, charset='utf8mb4',
-        cursorclass=pymysql.cursors.DictCursor, autocommit=False, connect_timeout=10))
+        cursorclass=pymysql.cursors.DictCursor, autocommit=False, connect_timeout=5,read_timeout=5,write_timeout=5))
 
 @contextlib.contextmanager
 def db():
@@ -105,6 +107,7 @@ MARIA_SCHEMA = [
 ]
 
 def init():
+    global INVENTORY_STORE
     with db() as c:
         if MARIA:
             for statement in MARIA_SCHEMA: c.execute(statement)
@@ -117,6 +120,9 @@ def init():
         for k,v in DEFAULTS.items():
             c.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (k,json.dumps(v)))
     if not MARIA: os.chmod(DB, 0o600)
+    from inventory_store import InventoryStore
+    INVENTORY_STORE = InventoryStore(db, maria=MARIA, max_snapshots=48)
+    INVENTORY_STORE.migrate()
 
 def migrate_from_sqlite(path):
     """Une fois, au passage de SQLite à MariaDB : reprend mot de passe, réglages, contrôles, historique et incidents."""
@@ -124,7 +130,9 @@ def migrate_from_sqlite(path):
     if rows("SELECT `key` FROM settings WHERE `key`='password_hash'"): return False
     src=sqlite3.connect(f'file:{path}?mode=ro',uri=True); src.row_factory=sqlite3.Row
     with db() as c:
-        for table in ('settings','monitors','checks','samples','incidents','events','projects','heartbeats'):
+        for table in ('settings','monitors','checks','samples','incidents','events','projects','heartbeats',
+                      'inventory_migrations','inventory_config','inventory_state','inventory_snapshots',
+                      'inventory_metrics','inventory_changes','inventory_relations'):
             try: data=src.execute(f'SELECT * FROM {table}').fetchall()
             except sqlite3.Error: continue
             for r in data:
@@ -142,10 +150,8 @@ def event(kind, message):
         c.execute('INSERT INTO events(ts,kind,message) VALUES (?,?,?)',(time.time(),kind,message[:1000]))
 
 def run(args, timeout=8):
-    p = subprocess.run(args, text=True, capture_output=True, timeout=timeout, env={**os.environ,'LC_ALL':'C'})
-    if p.returncode:
-        raise RuntimeError((p.stderr or p.stdout or 'Commande indisponible')[:180])
-    return p.stdout
+    from collector_runtime import CollectorContext
+    return CollectorContext(deadline=time.monotonic()+timeout).run(args,timeout=timeout,max_bytes=2_000_000)
 
 def notify(title, message):
     s = settings()
@@ -332,7 +338,9 @@ def monitors():
        ORDER BY m.group_name,m.name''',(time.time()-86400,time.time()-86400))
 
 
-INSPECT = ('{"id":{{json .Id}},"name":{{json .Name}},"labels":{{json .Config.Labels}},"started":{{json .State.StartedAt}},'
+INSPECT = ('{"id":{{json .Id}},"name":{{json .Name}},'
+           '"compose":{{json (index .Config.Labels "com.docker.compose.project")}},'
+           '"source":{{json (index .Config.Labels "org.opencontainers.image.source")}},"started":{{json .State.StartedAt}},'
            '"restarts":{{.RestartCount}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},'
            '"ports":{{json .NetworkSettings.Ports}},"created":{{json .Created}},"policy":{{json .HostConfig.RestartPolicy.Name}},'
            '"exit":{{.State.ExitCode}},"oom":{{json .State.OOMKilled}}}')
@@ -352,15 +360,25 @@ def collect_docker():
         except Exception: pass
     result=[]
     for r in listing:
-        d=details.get(r['ID'][:12],{}); labels=d.get('labels') or {}
+        d=details.get(r['ID'][:12],{})
         ports=sorted({f"{b['HostIp'] or '0.0.0.0'}:{b['HostPort']}->{k}" for k,v in (d.get('ports') or {}).items() for b in (v or [])})
         result.append({'name':r['Names'],'image':r['Image'],'state':r['State'],'status':r['Status'],
            'cpu':stats.get(r['ID'],{}).get('CPUPerc','—'),'memory':stats.get(r['ID'],{}).get('MemUsage','—'),
            'network':stats.get(r['ID'],{}).get('NetIO','—'),'io':stats.get(r['ID'],{}).get('BlockIO','—'),
-           'health':d.get('health'),'restarts':d.get('restarts',0),'started':d.get('started'),'created':d.get('created'),
-           'ports':ports,'policy':d.get('policy'),'oom':d.get('oom',False),'exit_code':d.get('exit'),
-           'compose':labels.get('com.docker.compose.project'),'source':labels.get('org.opencontainers.image.source')})
+           'health':d.get('health'),'restarts':d.get('restarts'),'started':d.get('started'),'created':d.get('created'),
+           'ports':ports,'policy':d.get('policy'),'oom':d.get('oom'),'exit_code':d.get('exit'),
+           'details_status':'available' if d else 'unavailable',
+           'compose':d.get('compose'),'source':safe_source_url(d.get('source'))})
     return result
+
+def safe_source_url(value):
+    """OCI source metadata may contain credentials: retain only a clean repository URL."""
+    if not isinstance(value,str) or len(value)>500: return None
+    try:
+        u=urlsplit(value)
+        if u.scheme not in ('http','https') or not u.hostname or u.username or u.password or u.query or u.fragment: return None
+    except ValueError: return None
+    return value
 
 def collect_services():
     """Services systemd : `systemctl` d'abord ; à défaut (conteneur), les services en cours lus dans les cgroups."""
@@ -443,12 +461,12 @@ def default_gateway():
             except (ValueError,OverflowError): pass
     return None
 
-UPDATES={'count':None,'security':None,'checked':0}
+UPDATES={'count':None,'security':None,'checked':0,'packages':None}
 def check_updates():
     try:
         lines=[l for l in run(['apt','list','--upgradable'],40).splitlines() if '/' in l]
-        UPDATES.update(count=len(lines),security=sum(1 for l in lines if 'security' in l.split()[0]),checked=time.time())
-    except Exception: UPDATES.update(count=None,security=None,checked=time.time())
+        UPDATES.update(count=len(lines),security=sum(1 for l in lines if 'security' in l.split()[0]),checked=time.time(),packages=sorted({l.split('/')[0] for l in lines}))
+    except Exception: UPDATES.update(count=None,security=None,checked=time.time(),packages=None)
 
 def filesystems():
     result=[]
@@ -458,7 +476,8 @@ def filesystems():
         try: u=psutil.disk_usage((HOST_ROOT+p.mountpoint) if HOST_ROOT else p.mountpoint)
         except OSError: continue
         if not u.total: continue
-        result.append({'mount':p.mountpoint,'device':p.device,'fstype':p.fstype,'options':p.opts,'total':u.total,'used':u.used,'percent':u.percent})
+        safe_options=','.join(v for v in p.opts.split(',') if v in {'ro','rw','nodev','nosuid','noexec','relatime','noatime','sync','async'})
+        result.append({'mount':p.mountpoint,'device':p.device,'fstype':p.fstype,'options':safe_options,'total':u.total,'used':u.used,'percent':u.percent})
     return result[:40]
 
 IO_PREV={}
@@ -512,6 +531,8 @@ def collect_system():
     fh=read_text('/proc/sys/fs/file-nr').split()
     resolvers=[l.split()[1] for l in read_text('/etc/resolv.conf').splitlines() if l.startswith('nameserver') and len(l.split())>1]
     cs=psutil.cpu_stats()
+    try: session_count=len(psutil.users()); session_error=None
+    except (OSError,psutil.Error): session_count=None; session_error='Sessions non accessibles.'
     return {
       'os':host_platform(),'hostname':host_file('/etc/hostname',socket.gethostname()),'arch':platform.machine(),'kernel':platform.release(),
       'boot_time':psutil.boot_time(),'timezone':read_text('/etc/timezone') or time.tzname[0],'virtualization':virt or None,
@@ -524,7 +545,7 @@ def collect_system():
       'interfaces':interfaces,'listening':listening_ports(),'connections':connection_states(),'gateway':default_gateway(),'dns':resolvers,
       'process_states':states,'processes':sum(states.values()),'threads':threads or None,
       'file_handles':{'allocated':int(fh[0]),'max':int(fh[2])} if len(fh)>=3 else None,'entropy':read_text('/proc/sys/kernel/random/entropy_avail') or None,
-      'users':[{'name':u.name,'terminal':u.terminal,'host':u.host,'started':u.started} for u in psutil.users()],
+      'users':[], 'session_count':session_count, 'session_error':session_error,
       'reboot_required':Path('/var/run/reboot-required').exists(),'updates':dict(UPDATES),'failed_units':failed,'ntp_synchronized':sync,
       'docker':{'version':docker_version()},'python':platform.python_version(),
     }
@@ -536,41 +557,35 @@ RUNTIMES=[('Python','python3',['--version']),('Node.js','node',['--version']),('
   ('Redis','redis-server',['--version']),('Nginx','nginx',['-v']),('Apache','apache2',['-v']),('OpenSSL','openssl',['version']),('curl','curl',['--version']),
   ('GCC','gcc',['--version']),('Make','make',['--version']),('OpenSSH','ssh',['-V']),('systemd','systemctl',['--version']),('Certbot','certbot',['--version'])]
 
-def parse_dpkg(output, manual=(), upgradable=()):
-    """Sortie de `dpkg-query -W -f='${binary:Package}\\t${Version}\\t${Installed-Size}\\t${Status}\\n'` -> liste de paquets installés."""
-    packages=[]
-    for line in output.splitlines():
-        parts=line.split('\t')
-        if len(parts)<4 or not parts[3].endswith(' installed'): continue
-        name=parts[0]; base=name.split(':')[0]
-        packages.append({'name':name,'version':parts[1],'size_kb':int(parts[2] or 0),'manual':base in manual,'upgradable':base in upgradable})
-    return sorted(packages,key=lambda p:p['name'])
+from software_inventory import parse_dpkg
 
-def collect_software():
+def collect_software(ctx=None):
     """Inventaire des logiciels (toutes les heures) : paquets système, environnements d'exécution, images et volumes Docker."""
     import shutil
+    from collector_runtime import CollectorContext
+    from software_inventory import collect_packages
+    ctx=ctx or CollectorContext(deadline=time.monotonic()+100)
+    bounded_run=lambda args,timeout=8: ctx.run(args,timeout=timeout,max_bytes=2_000_000)
     result={'packages':[],'runtimes':[],'docker_images':[],'docker_volumes':[],'checked':time.time(),'error':None}
-    try:
-        manual=set(run(['apt-mark','showmanual'],20).split())
-        try: upgradable={l.split('/')[0] for l in run(['apt','list','--upgradable'],40).splitlines() if '/' in l}
-        except Exception: upgradable=set()
-        out=run(['dpkg-query','-W','-f','${binary:Package}\t${Version}\t${Installed-Size}\t${Status}\n'],20)
-        result['packages']=parse_dpkg(out,manual,upgradable)
-    except Exception: result['error']='Liste des paquets indisponible (gestionnaire de paquets Debian/Ubuntu requis).'
+    names=UPDATES.get('packages')
+    result.update(collect_packages(bounded_run,shutil.which,upgradable=set(names) if names is not None else None))
     for label,command,args in RUNTIMES:
+        ctx.remaining()
         path=shutil.which(command)
         if not path: continue
         try:
-            p=subprocess.run([path,*args],text=True,capture_output=True,timeout=4,env={**os.environ,'LC_ALL':'C'})
-            text=((p.stdout or '')+(p.stderr or '')).strip().splitlines()
-            version=text[0][:120] if text else ''
-        except Exception: version=''
-        result['runtimes'].append({'name':label,'command':command,'path':path,'version':version})
+            # These fixed --version/-V queries legitimately write to stderr.
+            # Capture only their bounded version output, never command errors.
+            text=ctx.run([path,*args],timeout=4,max_bytes=16384,include_stderr=True).strip().splitlines()
+            version=next((line[:120] for line in text if re.search(r'\d+\.\d+',line)),None)
+        except Exception: version=None
+        result['runtimes'].append({'name':label,'command':command,'path':path,'version':version,
+                                  'version_status':'available' if version else 'unavailable'})
     try:
-        for line in run(['docker','images','--format','{{json .}}'],15).splitlines():
+        for line in bounded_run(['docker','images','--format','{{json .}}'],15).splitlines():
             if line.strip(): d=json.loads(line); result['docker_images'].append({'repository':d['Repository'],'tag':d['Tag'],'id':d['ID'],'size':d['Size'],'created':d['CreatedSince']})
     except Exception: pass
-    try: result['docker_volumes']=[l.strip() for l in run(['docker','volume','ls','-q'],10).splitlines() if l.strip()]
+    try: result['docker_volumes']=[l.strip() for l in bounded_run(['docker','volume','ls','-q'],10).splitlines() if l.strip()]
     except Exception: pass
     return result
 
@@ -590,29 +605,98 @@ def system_alerts(system):
     for i in system.get('inodes',[]):
         incident('system:inodes:'+i['mount'],i['percent']>=limit,'Inodes : '+i['mount'],f"{i['percent']} % utilisés")
 
+def inventory_specs():
+    """Adapt existing collectors without duplicating their collection mechanisms."""
+    from collector_runtime import CollectorSpec, Detection
+    from host_collectors import default_collectors
+    import shutil
+    def command(name):
+        return lambda ctx: Detection('available') if shutil.which(name) else Detection('unavailable','Outil optionnel absent : '+name)
+    def system(ctx):
+        value=collect_system()
+        # Keep current metrics separate from historical inventory metadata.
+        return value
+    def updates(ctx):
+        check_updates()
+        if UPDATES['count'] is None: raise OSError('updates unavailable')
+        return dict(UPDATES)
+    legacy=[
+        CollectorSpec('host_system','Système et matériel','system',lambda ctx: Detection(),system,
+                      interval=30,timeout=15,permissions=('Lecture /proc et /sys',),limits={'max_bytes':262144},schema={'kind':'host_system'}),
+        CollectorSpec('containers','Conteneurs Docker','containers',command('docker'),lambda ctx:{'items':collect_docker()},
+                      dependencies=('docker',),interval=15,timeout=35,permissions=('API Docker en lecture seule',),limits={'max_bytes':262144},schema={'kind':'containers'}),
+        CollectorSpec('services','Services Linux','services',lambda ctx: Detection(),lambda ctx:{'items':collect_services()},
+                      interval=30,timeout=10,permissions=('D-Bus systemd ou cgroups lisibles',),limits={'max_bytes':262144},schema={'kind':'services'}),
+        CollectorSpec('software','Logiciels installés','software',lambda ctx: Detection(),collect_software,
+                      interval=3600,timeout=120,permissions=('Métadonnées des paquets',),limits={'max_bytes':262144},schema={'kind':'software'}),
+        CollectorSpec('updates','Mises à jour disponibles','software',command('apt'),updates,
+                      dependencies=('apt',),interval=3600,timeout=45,permissions=('Cache local des paquets',),limits={'max_bytes':4096},schema={'kind':'updates'}),
+    ]
+    from docker_topology import make_spec
+    from dataclasses import replace
+    specs=legacy+default_collectors()+[make_spec()]
+    # The scheduler and the store must agree on their accepted payload budget.
+    return [replace(spec,limits={**spec.limits,'max_bytes':min(spec.limits.get('max_bytes',262144),262144)}) for spec in specs]
+
+def inventory_cache(result):
+    """A short in-memory callback, independent of the database writer."""
+    ident=result['id']; good=result['status']=='available'; data=result['data']
+    cache_key={'host_system':'system','containers':'containers','services':'services'}.get(ident)
+    with LOCK:
+        if cache_key:
+            if good:
+                CACHE[cache_key]=data if ident=='host_system' else data.get('items',[])
+                CACHE['errors'].pop(cache_key,None)
+            else: CACHE['errors'][cache_key]=result['reason']
+        if ident=='software' and good: SOFTWARE.update(data)
+
+def inventory_result(result):
+    """Persistence runs in its own single, bounded background worker."""
+    ident=result['id']; good=result['status']=='available'; data=result['data']
+    if good and ident=='host_system': system_alerts(data)
+    if INVENTORY_STORE is None: return
+    metrics={}
+    if good and ident=='pressure':
+        for resource,modes in data.get('resources',{}).items():
+            for mode,values in (modes or {}).items():
+                if isinstance(values,dict):
+                    for key,value in values.items():
+                        if key.startswith('avg') and isinstance(value,(int,float)):
+                            metrics[f'{resource}.{mode}.{key}']=value
+    persisted={**result,'data':dict(data)}
+    # Volatile CPU/RAM/counters already have a timeseries; avoid noisy change events.
+    if ident=='host_system':
+        persisted['data']={k:data[k] for k in ('os','arch','kernel','virtualization','vendor','product','cpu','block_devices','docker') if k in data}
+        if 'cpu' in persisted['data']:
+            persisted['data']['cpu']={k:v for k,v in data['cpu'].items() if k in ('model','physical','logical','max_mhz','cache')}
+    elif ident=='software':
+        persisted['data']={k:v for k,v in data.items() if k not in ('checked','error')}
+    elif ident=='containers':
+        persisted['data']={'items':[{k:v for k,v in row.items() if k not in ('cpu','memory','network','io','status')} for row in data.get('items',[])]}
+    elif ident in ('services','service_metadata'):
+        key='items' if ident=='services' else 'services'
+        persisted['data']={key:[{k:v for k,v in row.items() if k not in ('cpu_seconds','memory_bytes','memory','tasks','description')} for row in data.get(key,[])]}
+    elif ident=='updates':
+        persisted['data']={k:v for k,v in data.items() if k!='checked'}
+    INVENTORY_STORE.record(persisted,snapshot=ident not in ('pressure','cgroup_limits'),metrics=metrics or None,
+                           relations=data.get('relations') if ident=='docker_topology' and good else None)
+
 def inventory():
-    system_at=0; updates_at=0
-    while not STOP.is_set():
-        for key,fn in [('containers',collect_docker),('services',collect_services)]:
-            try:
-                value=fn()
-                with LOCK: CACHE[key]=value; CACHE['errors'].pop(key,None)
-            except Exception:
-                with LOCK: CACHE['errors'][key]='Collecte indisponible : vérifier les permissions du service.'
-        if time.time()-system_at>=30:
-            system_at=time.time()
-            try:
-                if time.time()-updates_at>=3600:
-                    updates_at=time.time(); threading.Thread(target=check_updates,daemon=True).start()
-                    def refresh_software():
-                        try: SOFTWARE.update(collect_software())
-                        except Exception: log.exception('Software inventory failed')
-                    threading.Thread(target=refresh_software,daemon=True).start()
-                value=collect_system()
-                with LOCK: CACHE['system']=value
-                system_alerts(value)
-            except Exception: log.exception('System info failed')
-        STOP.wait(10)
+    global INVENTORY_RUNTIME
+    from collector_runtime import CollectorRuntime
+    try:
+        intervals=json.loads(os.environ.get('MONITOR_COLLECTOR_INTERVALS','{}'))
+        if not isinstance(intervals,dict) or any(isinstance(v,bool) or not isinstance(v,(int,float)) or not 10<=v<=86400 for v in intervals.values()):
+            raise ValueError('Invalid inventory interval')
+        INVENTORY_RUNTIME=CollectorRuntime(inventory_specs(),intervals=intervals,on_sample=inventory_cache,on_result=inventory_result,max_workers=2)
+    except (ValueError,TypeError):
+        log.warning('Collector interval configuration invalid; using defaults')
+        INVENTORY_RUNTIME=CollectorRuntime(inventory_specs(),on_sample=inventory_cache,on_result=inventory_result,max_workers=2)
+    try:
+        while not STOP.is_set():
+            INVENTORY_RUNTIME.tick()
+            STOP.wait(.25)
+    finally: INVENTORY_RUNTIME.close()
 
 def collect():
     psutil.cpu_percent(percpu=True)

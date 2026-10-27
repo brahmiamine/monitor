@@ -93,6 +93,13 @@ const KIND = { http: 'Site HTTP(S)', keyword: 'HTTP + mot-clé', json: 'HTTP + J
 
 // ---------- Pages ----------
 const PAGES = {
+  inventory: { title: 'Inventaire', desc: 'Ressources détectées automatiquement, fraîcheur des données et limites d’accès.', async render() {
+    if (!S.inventory || Date.now() - (S.inventoryLoadedAt || 0) > 30000) {
+      if (!S.inventoryRequest) S.inventoryRequest = api('/api/inventory').then((data) => { S.inventory = data; S.inventoryLoadedAt = Date.now(); }).finally(() => { S.inventoryRequest = null; });
+      await S.inventoryRequest;
+    }
+    return MonitorInventory.renderInventory(S.inventory, S.inventoryFilters || {});
+  } },
   overview: { title: 'Vue d’ensemble', desc: 'Tout ce qui fait tourner votre infrastructure, en temps réel.', live: true, render() {
     const l = S.live; if (!l?.ts) return '<div class="empty">Chargement des mesures réelles du serveur…</div>';
     const down = S.monitors.filter((m) => !m.paused && m.ok === 0), open = S.incidents.filter((i) => !i.closed);
@@ -132,17 +139,7 @@ const PAGES = {
   software: { title: 'Logiciels', desc: 'Paquets installés, environnements d’exécution, images et volumes Docker.', async render() {
     const d = await api('/api/software');
     if (!d.checked) return '<div class="empty">Inventaire en cours… Revenez dans quelques instants.</div>';
-    const q = (S.q || '').toLowerCase(), manual = !!S.manualOnly;
-    const all = d.packages || [], list = all.filter((p) => (!manual || p.manual) && p.name.toLowerCase().includes(q));
-    const shown = list.slice(0, 300), kb = (n) => bytes(n * 1024);
-    const total = all.reduce((a, p) => a + p.size_kb, 0), up = all.filter((p) => p.upgradable).length;
-    return `<div class="metric-grid"><div class="metric"><div class="metric-label">Paquets installés</div><div class="metric-value">${all.length}</div><div class="metric-note">${all.filter((p) => p.manual).length} installés à la main</div></div><div class="metric"><div class="metric-label">Espace occupé</div><div class="metric-value" style="font-size:22px">${kb(total)}</div><div class="metric-note">par les paquets système</div></div><div class="metric"><div class="metric-label">Mises à jour</div><div class="metric-value ${up ? 'bad' : ''}">${up}</div><div class="metric-note">${d.updates?.security ? d.updates.security + ' de sécurité' : 'aucune de sécurité signalée'}</div></div><div class="metric"><div class="metric-label">Docker</div><div class="metric-value">${(d.docker_images || []).length}</div><div class="metric-note">images · ${(d.docker_volumes || []).length} volumes</div></div></div>
-    ${panel('Environnements d’exécution et outils', table(['Outil', 'Version', 'Chemin'], (d.runtimes || []).map((r) => `<tr><td><strong>${esc(r.name)}</strong></td><td class="log-message">${esc(r.version)}</td><td>${esc(r.path)}</td></tr>`), 'Aucun outil détecté.'), { note: 'Ce qui est installé et exécutable sur le serveur' })}
-    <div style="height:24px"></div>
-    ${panel('Images Docker', table(['Image', 'Étiquette', 'Taille', 'Créée'], (d.docker_images || []).map((i) => `<tr><td><strong>${esc(i.repository)}</strong></td><td>${esc(i.tag)}</td><td>${esc(i.size)}</td><td>${esc(i.created)}</td></tr>`), 'Aucune image (ou accès Docker indisponible).'), { note: `${(d.docker_volumes || []).length} volume(s) : ${esc((d.docker_volumes || []).slice(0, 8).join(', '))}` })}
-    <div style="height:24px"></div>
-    <div class="toolbar"><input id="filter" type="search" placeholder="Filtrer les paquets…" value="${esc(S.q || '')}" aria-label="Filtrer les paquets"><button data-manual="1" class="${manual ? 'primary' : ''}">Installés à la main</button><span class="muted">${list.length} paquet(s)${list.length > shown.length ? ' · 300 premiers affichés' : ''}</span></div>
-    ${d.error ? `<div class="notice error">${esc(d.error)}</div>` : panel('Paquets système', table(['Paquet', 'Version', 'Taille', 'Origine', ''], shown.map((p) => `<tr><td><strong>${esc(p.name)}</strong></td><td>${esc(p.version)}</td><td>${kb(p.size_kb)}</td><td>${p.manual ? 'manuel' : 'dépendance'}</td><td>${p.upgradable ? badge('pending', 'mise à jour') : ''}</td></tr>`), 'Aucun paquet.'), { note: `Inventaire du ${stamp(d.checked)}` })}`;
+    return MonitorInventory.renderSoftware(d, { query: S.q || '', manualOnly: !!S.manualOnly });
   } },
 
   projects: { title: 'Projets', desc: 'Vos applications : adresse, dépôt GitHub, état et dernier déploiement.', async render() {
@@ -180,15 +177,15 @@ const PAGES = {
     ${panel('Systèmes de fichiers montés', table(['Point de montage', 'Type', 'Périphérique', 'Utilisé', 'Total', '%'], (y.filesystems || []).map((f) => `<tr><td><strong>${esc(f.mount)}</strong></td><td>${esc(f.fstype)}</td><td>${esc(f.device)}</td><td>${bytes(f.used)}</td><td>${bytes(f.total)}</td><td>${f.percent} %</td></tr>`), 'Aucun système de fichiers.'), { note: 'Disques, partitions et espaces temporaires' })}
     ${panel('Activité des disques', table(['Disque', 'Lectures', 'Écritures', 'Lu', 'Écrit', 'E/S par s'], (y.disk_io || []).map((d) => `<tr><td><strong>${esc(d.name)}</strong></td><td>${d.reads.toLocaleString('fr-FR')}</td><td>${d.writes.toLocaleString('fr-FR')}</td><td>${bytes(d.read_bytes)}</td><td>${bytes(d.write_bytes)}</td><td>${d.iops ?? '—'}</td></tr>`), 'Aucune activité disque mesurée.'), { note: 'Compteurs cumulés depuis le démarrage' })}
     ${panel('Réseau', spec([['Passerelle', esc(y.gateway)], ['Serveurs DNS', esc((y.dns || []).join(', '))], ['Connexions', connections]]) + `<div class="network-list">${(y.interfaces || []).map((n) => `<div class="mini-row"><div><strong>${esc(n.name)}</strong><small>${esc([...n.ipv4, ...n.ipv6].join(' · ') || '—')}</small></div><span class="right">${n.up ? 'actif' : 'inactif'}${n.speed ? ' · ' + n.speed + ' Mb/s' : ''} · MTU ${n.mtu ?? '—'}<br>${esc(n.mac || '')}</span></div>`).join('')}</div>`)}
-    ${panel('Ports ouverts', table(['Protocole', 'Adresse', 'Port', 'Service probable', 'Exposition', 'Conteneur'], (y.listening || []).map((p) => `<tr><td>${esc(p.proto)}</td><td>${esc(p.address)}</td><td><strong>${p.port}</strong></td><td>${esc(p.service || '—')}</td><td>${p.exposure === 'public' ? '<span class="bad">toutes les interfaces</span>' : 'local seulement'}</td><td>${esc(p.container || '—')}</td></tr>`), 'Aucun port en écoute visible.'), { note: 'Un port « toutes les interfaces » accepte des connexions depuis l’extérieur, sauf si le pare-feu le bloque' })}
-    ${panel('Maintenance et sécurité', spec([['Redémarrage requis', y.reboot_required ? '<span class="bad">oui</span>' : 'non'], ['Mises à jour disponibles', up.count == null ? 'inconnu' : `${up.count}${up.security ? ` · <span class="bad">${up.security} de sécurité</span>` : ''}`], ['Dernière vérification', up.checked ? ago(up.checked) : null], ['Services en échec', failed == null ? 'inconnu' : failed.length ? `<span class="bad">${esc(failed.map((f) => f.name).join(', '))}</span>` : 'aucun'], ['Sessions ouvertes', (y.users || []).length ? esc(y.users.map((u) => `${u.name}@${u.host || 'local'}`).join(', ')) : 'aucune']]))}</div>`;
+    ${panel('Ports ouverts', table(['Protocole', 'Adresse', 'Port', 'Service probable', 'Exposition', 'Conteneur'], (y.listening || []).map((p) => `<tr><td>${esc(p.proto)}</td><td>${esc(p.address)}</td><td><strong>${p.port}</strong></td><td>${esc(p.service || '—')}</td><td>${p.exposure === 'public' ? 'adresse non locale' : 'boucle locale'}</td><td>${esc(p.container || '—')}</td></tr>`), 'Aucun port en écoute visible.'), { note: 'Adresse d’écoute observée ; accessibilité Internet non vérifiée, dépend du routage et du pare-feu' })}
+    ${panel('Maintenance et sécurité', spec([['Redémarrage requis', y.reboot_required ? '<span class="bad">oui</span>' : 'non'], ['Mises à jour disponibles', up.count == null ? 'inconnu' : `${up.count}${up.security ? ` · <span class="bad">${up.security} de sécurité</span>` : ''}`], ['Dernière vérification', up.checked ? ago(up.checked) : null], ['Services en échec', failed == null ? 'inconnu' : failed.length ? `<span class="bad">${esc(failed.map((f) => f.name).join(', '))}</span>` : 'aucun'], ['Sessions ouvertes', y.session_count == null ? 'inconnu' : esc(y.session_count)]]))}</div>`;
   } },
 
   containers: { title: 'Conteneurs', desc: 'Tous les conteneurs Docker et ce qu’ils consomment.', live: true, render() {
     const l = S.live; if (!l?.ts) return '<div class="empty">Chargement…</div>';
     if (l.errors?.containers) return `<div class="notice error">${esc(l.errors.containers)}</div>`;
     const since = (c) => (c.state === 'running' && c.started ? dur(Date.now() / 1000 - Date.parse(c.started) / 1000) : '—');
-    return panel('Conteneurs Docker', table(['Nom', 'Image', 'État', 'Santé', 'En ligne depuis', 'Redém.', 'Ports', 'CPU', 'Mémoire', 'Réseau', 'Disque'], (l.containers || []).map((c) => `<tr><td><strong>${esc(c.name)}</strong>${c.compose ? `<small>${esc(c.compose)}</small>` : ''}</td><td>${esc(c.image)}</td><td>${badge(c.state === 'running' ? '' : 'down', c.state)}</td><td>${c.health ? badge(c.health === 'healthy' ? '' : 'down', c.health) : '—'}</td><td>${since(c)}</td><td>${c.restarts || 0}${c.oom ? ' · OOM' : ''}</td><td class="log-message">${esc((c.ports || []).join(', ') || '—')}</td><td>${esc(c.cpu)}</td><td>${esc(c.memory)}</td><td>${esc(c.network)}</td><td>${esc(c.io)}</td></tr>`), 'Aucun conteneur détecté.'), { note: 'Mesures prises toutes les 10 secondes' });
+    return panel('Conteneurs Docker', table(['Nom', 'Image', 'État', 'Santé', 'En ligne depuis', 'Redém.', 'Ports', 'CPU', 'Mémoire', 'Réseau', 'Disque'], (l.containers || []).map((c) => `<tr><td><strong>${esc(c.name)}</strong>${c.compose ? `<small>${esc(c.compose)}</small>` : ''}</td><td>${esc(c.image)}</td><td>${badge(c.state === 'running' ? '' : 'down', c.state)}</td><td>${c.health ? badge(c.health === 'healthy' ? '' : 'down', c.health) : '—'}</td><td>${since(c)}</td><td>${c.restarts ?? '—'}${c.oom ? ' · OOM' : ''}</td><td class="log-message">${esc((c.ports || []).join(', ') || '—')}</td><td>${esc(c.cpu)}</td><td>${esc(c.memory)}</td><td>${esc(c.network)}</td><td>${esc(c.io)}</td></tr>`), 'Aucun conteneur détecté.'), { note: 'Mesures selon la fréquence du collecteur ; fraîcheur détaillée dans Inventaire' });
   } },
 
   services: { title: 'Services système', desc: 'Services systemd en cours d’exécution sur le serveur.', live: true, render() {
@@ -231,8 +228,17 @@ const PAGES = {
 
 // ---------- Rendu ----------
 async function render() {
-  const page = PAGES[S.page], content = $('#content');
-  try { content.innerHTML = await page.render(); } catch (e) { if (e.message !== 'Connexion requise') content.innerHTML = `<div class="notice error">${esc(e.message)}</div>`; }
+  const name = S.page, page = PAGES[name], content = $('#content');
+  const version = S.renderVersion = (S.renderVersion || 0) + 1;
+  const current = () => S.page === name && S.renderVersion === version;
+  try {
+    const html = await page.render();
+    if (!current()) return;
+    content.innerHTML = html;
+  } catch (e) {
+    if (!current()) return;
+    if (e.message !== 'Connexion requise') content.innerHTML = `<div class="notice error">${esc(e.message)}</div>`;
+  }
   decorate(content);
 }
 const liveRender = () => { if (PAGES[S.page].live && !document.activeElement?.closest?.('#content input,#content textarea')) render(); };
@@ -256,8 +262,33 @@ async function loadMonitors() {
 }
 
 // ---------- Détail et formulaire d'un contrôle ----------
-function openDialog(title, html) { $('#dialog-title').textContent = title; $('#dialog-body').innerHTML = html; decorate($('#dialog')); if (!$('#dialog').open) $('#dialog').showModal(); }
+function openDialog(title, html) { S.inventoryDialog = null; $('#dialog-title').textContent = title; $('#dialog-body').innerHTML = html; decorate($('#dialog')); if (!$('#dialog').open) $('#dialog').showModal(); }
+async function showInventoryHistory(id) {
+  const collector = (S.inventory?.collectors || []).find((c) => c.id === id);
+  openDialog(collector?.title || id, '<div class="empty" role="status">Chargement de l’historique…</div>');
+  S.inventoryDialog = id;
+  try {
+    const query = encodeURIComponent(id);
+    const [history, changes] = await Promise.all([api(`/api/inventory/history?collector=${query}&limit=100`), api(`/api/inventory/changes?collector=${query}&limit=30`)]);
+    if (!$('#dialog').open || S.inventoryDialog !== id) return;
+    $('#dialog-body').innerHTML = MonitorInventory.renderHistory(history, changes, id);
+    if (id === 'pressure' || id === 'psi') {
+      try {
+        const points = await api(`/api/inventory/metrics?collector=${query}&hours=24`);
+        if (!$('#dialog').open || S.inventoryDialog !== id) return;
+        const series = MonitorInventory.metricSeries(points);
+        const graph = series.some((s) => s.values.some((p) => p[1] != null)) ? chart(series, { max: 100, height: 180, fmt: (v) => Math.round(v) + '%' }) : '<div class="empty">Aucune mesure de pression disponible sur cette période.</div>';
+        $('#dialog-body').insertAdjacentHTML('afterbegin', `<h3 class="inventory-section-title">Pression des ressources · 24 heures</h3><div class="chart-wrap">${graph}</div>${legend(...series.map((s) => s.name))}`);
+      } catch (error) {
+        if ($('#dialog').open && S.inventoryDialog === id) $('#dialog-body').insertAdjacentHTML('afterbegin', `<p class="notice error">Historique des mesures indisponible : ${esc(error.message)}</p>`);
+      }
+    }
+  } catch (error) {
+    if ($('#dialog').open && S.inventoryDialog === id) $('#dialog-body').innerHTML = `<p class="notice error">${esc(error.message)}</p>`;
+  }
+}
 async function showDetail(id) {
+  S.inventoryDialog = null;
   const m = S.monitors.find((x) => x.id === id); if (!m) return;
   const h = await api(`/api/monitors/${id}/history?hours=24`);
   openDialog(m.name, `<div class="detail-summary">${monitorBadge(m)}<div><strong>${esc(KIND[m.kind])}</strong><p>${esc(m.target || 'Signal de vie')}</p></div></div>
@@ -310,7 +341,9 @@ function projectForm(p = {}) {
 document.addEventListener('click', async (ev) => {
   const t = ev.target.closest('button,a'); if (!t) return;
   try {
-    if (t.dataset.manual) { S.manualOnly = !S.manualOnly; render(); }
+    if (t.id === 'inventory-refresh') { S.inventoryLoadedAt = 0; await render(); }
+    else if (t.dataset.inventoryHistory) await showInventoryHistory(t.dataset.inventoryHistory);
+    else if (t.dataset.manual) { S.manualOnly = !S.manualOnly; render(); }
     else if (t.dataset.hours) { S.hours = +t.dataset.hours; await loadHistory(); render(); }
     else if (t.dataset.detail) await showDetail(+t.dataset.detail);
     else if (t.dataset.check || t.dataset.pause) { const id = +(t.dataset.check || t.dataset.pause); await api(`/api/monitors/${id}/action`, { method: 'POST', body: { action: t.dataset.check ? 'check' : 'pause' } }); toast(t.dataset.check ? 'Vérification lancée' : 'Contrôle mis à jour'); setTimeout(async () => { await loadMonitors(); render(); }, t.dataset.check ? 2500 : 200); }
@@ -329,15 +362,33 @@ document.addEventListener('click', async (ev) => {
     else if (t.id === 'test-notify') toast((await api('/api/notifications/test', { method: 'POST' })).message);
   } catch (e) { toast(e.message, true); }
 });
-document.addEventListener('input', (ev) => { if (ev.target.id === 'filter') { S.q = ev.target.value; const pos = ev.target.selectionStart; render().then?.(() => {}); setTimeout(() => { const f = $('#filter'); if (f) { f.focus(); f.setSelectionRange(pos, pos); } }, 0); } });
+document.addEventListener('input', (ev) => {
+  if (ev.target.id === 'inventory-search') {
+    S.inventoryFilters = { ...S.inventoryFilters, query: ev.target.value };
+    const pos = ev.target.selectionStart;
+    render().then(() => { const input = $('#inventory-search'); if (input) { input.focus(); input.setSelectionRange(pos, pos); } });
+  } else if (ev.target.id === 'filter') { S.q = ev.target.value; const pos = ev.target.selectionStart; render().then?.(() => {}); setTimeout(() => { const f = $('#filter'); if (f) { f.focus(); f.setSelectionRange(pos, pos); } }, 0); }
+});
 document.addEventListener('submit', async (ev) => {
   const form = ev.target;
   try {
-    if (form.id === 'settings-form') { ev.preventDefault(); const d = new FormData(form), body = {}; for (const [k, v] of Object.entries(S.settings)) body[k] = typeof v === 'number' ? +d.get(k) : typeof v === 'boolean' ? d.has(k) : (d.get(k) ?? v); body.maintenance_until = S.settings.maintenance_until || 0; await api('/api/settings', { method: 'PUT', body }); toast('Paramètres enregistrés'); }
+    if (form.id === 'inventory-compare') {
+      ev.preventDefault();
+      const fields = new FormData(form), before = Number(fields.get('before')), after = Number(fields.get('after'));
+      if (!Number.isSafeInteger(before) || !Number.isSafeInteger(after) || before < 1 || after < 1 || before === after) { toast('Choisissez deux inventaires différents.', true); return; }
+      const id = S.inventoryDialog;
+      const diff = await api(`/api/inventory/compare?before=${before}&after=${after}`);
+      if (S.inventoryDialog === id && $('#inventory-comparison')) $('#inventory-comparison').innerHTML = MonitorInventory.renderComparison(diff);
+    }
+    else if (form.id === 'settings-form') { ev.preventDefault(); const d = new FormData(form), body = {}; for (const [k, v] of Object.entries(S.settings)) body[k] = typeof v === 'number' ? +d.get(k) : typeof v === 'boolean' ? d.has(k) : (d.get(k) ?? v); body.maintenance_until = S.settings.maintenance_until || 0; await api('/api/settings', { method: 'PUT', body }); toast('Paramètres enregistrés'); }
     else if (form.id === 'password-form') { ev.preventDefault(); const d = new FormData(form); await api('/api/password', { method: 'POST', body: { current: d.get('current'), new: d.get('new') } }); toast('Mot de passe modifié, reconnexion…'); setTimeout(showLogin, 1200); }
   } catch (e) { toast(e.message, true); }
 });
 document.addEventListener('change', async (ev) => {
+  if (ev.target.id === 'inventory-category' || ev.target.id === 'inventory-status') {
+    const key = ev.target.id === 'inventory-category' ? 'category' : 'status';
+    S.inventoryFilters = { ...S.inventoryFilters, [key]: ev.target.value }; await render(); $(`#${ev.target.id}`)?.focus(); return;
+  }
   if (ev.target.id !== 'import-file') return;
   try { const text = await ev.target.files[0].text(); const r = await api('/api/import', { method: 'POST', body: JSON.parse(text) }); toast(`${r.imported} contrôle(s) importé(s)`); await loadMonitors(); } catch (e) { toast(e.message, true); }
 });
@@ -361,7 +412,7 @@ async function start() {
   $('#login').hidden = true; $('#shell').hidden = false; decorate();
   await loadMonitors(); connect(); await go();
   setInterval(async () => { if (!document.hidden) { await loadMonitors(); if (['monitors', 'incidents'].includes(S.page) && !$('#dialog').open) render(); } }, 15000);
-  setInterval(async () => { if (!document.hidden && (S.page === 'overview' || S.page === 'server')) { await loadHistory(); } }, 30000);
+  setInterval(async () => { if (!document.hidden && (S.page === 'overview' || S.page === 'server')) { await loadHistory(); } else if (!document.hidden && S.page === 'inventory' && !$('#dialog').open && !document.activeElement?.closest?.('#content input,#content select,#content details')) { await render(); } }, 30000);
   setInterval(() => { $('#clock').textContent = new Date().toLocaleTimeString('fr-FR'); const stale = S.last && Date.now() - S.last > 10000; $('#stale-banner').hidden = !stale; $('#sidebar-dot').classList.toggle('bad', !!stale); }, 1000);
 }
 $('#login-form').addEventListener('submit', async (ev) => {

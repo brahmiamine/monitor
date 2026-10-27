@@ -4,7 +4,7 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
-sudo rsync -a --delete --chown=root:root --chmod=D755,F644 app.py engine.py static requirements.txt /opt/monitor/app/
+sudo rsync -a --delete --chown=root:root --chmod=D755,F644 app.py engine.py collector_runtime.py host_collectors.py inventory_store.py docker_topology.py software_inventory.py static requirements.txt /opt/monitor/app/
 [ -x /opt/monitor/venv/bin/pip ] || sudo python3 -m venv /opt/monitor/venv
 sudo /opt/monitor/venv/bin/pip install --quiet --disable-pip-version-check -r /opt/monitor/app/requirements.txt
 [ "${1:-}" = "--no-restart" ] && exit 0

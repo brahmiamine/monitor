@@ -6,6 +6,9 @@ Application privée de supervision, en français : le serveur, ses conteneurs, s
 
 ## Fonctionnalités
 
+- **Inventaire automatique** : douze groupes de collecte avec détection, état, fraîcheur, dernière réussite et explication des limites d'accès. Recherche par catégorie ou statut, détails progressifs, historique des changements, comparaison et export JSON/CSV.
+- **Nouveaux indicateurs** : pression CPU/mémoire/E/S (PSI), limites cgroups du processus Monitor, timers, unités systemd installées et leurs dépendances/ressources/redémarrages, moteurs de bases détectés et états de sécurité accessibles. Aucun identifiant de base ni donnée métier n'est lu.
+- **Cartographie Docker** : liens observés entre conteneurs, réseaux et volumes nommés, avec provenance. Un réseau partagé ne constitue pas une preuve de dépendance applicative à une base. Les montages privés et variables d'environnement ne sont pas inspectés.
 - **Vue d'ensemble** : état global, processeur, mémoire, disque, réseau, applications, conteneurs, incidents ouverts.
 - **Projets** : pour chaque application, un bouton pour **ouvrir l'application** et pour **ouvrir son dépôt GitHub**, son état et sa disponibilité, son certificat HTTPS, son conteneur (état, CPU, mémoire) et son **dernier déploiement**. Les conteneurs du serveur qui n'ont pas encore de projet sont **détectés automatiquement** et s'ajoutent en un clic. Les projets sont enregistrés dans la base de données.
 - **Disponibilité** : contrôles HTTP(S), mot-clé, JSON, port TCP, DNS, ping, conteneur Docker, service systemd, certificat TLS et signal de vie (heartbeat) ; intervalle, délai, échecs avant alerte ; pause, maintenance, vérification immédiate ; historique de latence ; import/export.
@@ -27,8 +30,15 @@ Rien n'est propre à un serveur dans le code : sans configuration, Monitor utili
 | `MONITOR_DB` | `mysql://utilisateur:mot-de-passe@hôte/base` (ou `?socket=/run/mysqld/mysqld.sock`) pour **MariaDB / MySQL** ; vide : SQLite |
 | `MONITOR_MIGRATE_FROM` | reprise unique d'une base SQLite lors du passage à MariaDB |
 | `MONITOR_DEPLOY_STATE` | dossier des fichiers `{sha, at}` écrits par votre déploiement automatique (dernier déploiement des projets) |
+| `MONITOR_COLLECTOR_INTERVALS` | objet JSON de fréquences en secondes, par identifiant de collecteur ; 10 à 86 400 s, configuration invalide remplacée par les valeurs par défaut |
 
-Les informations système, les paquets et les conteneurs sont lus directement sur la machine (Debian/Ubuntu pour la liste des paquets ; le reste fonctionne sur tout Linux).
+Les informations sont lues dans le contexte et avec les permissions du service Monitor. Les paquets sont détectés via `dpkg-query` ou `rpm` : `apt-mark` reste facultatif. Sur RPM, l'origine manuel/dépendance et les mises à jour restent inconnues sans adaptateur de cache dédié ; Monitor ne lance ni installation ni rafraîchissement des dépôts. Les métriques internes des bases nécessitent une connexion dédiée autorisée et ne sont pas collectées dans cette version.
+
+Par exemple, `MONITOR_COLLECTOR_INTERVALS={"pressure":60,"docker_topology":300}` ralentit ces deux collecteurs. Les collecteurs existants sont réutilisés, avec au plus deux collectes simultanées. L'historisation dispose d'un travailleur séparé et d'une file bornée : une écriture lente ne bloque pas les prélèvements hôte ou le planificateur. L'interface distingue une erreur de collecte d'un enregistrement en attente ou en échec.
+
+L'historique d'inventaire utilise des tables additives `inventory_*`, séparées des mesures et incidents existants. Les limites applicatives sont 30 jours, 48 snapshots par groupe, 5 000 mesures et 1 000 changements par groupe ; les plafonds sont vérifiés au plus une fois par minute et peuvent limiter la période réellement visible. Un résultat persisté est borné à 256 Kio. Les compteurs volatils CPU/RAM/réseau ne produisent pas un événement de changement à chaque variation. Voir [les migrations et le retour arrière](migrations/README.md) et [la matrice de couverture / feuille de route](docs/server-inventory-roadmap.md).
+
+Les API privées `/api/inventory`, `/history`, `/changes`, `/metrics`, `/compare`, `/relations` et `/export` (ces suffixes sous `/api/inventory`) lisent le cache ou la base. Elles ne déclenchent pas de commandes système. Le schéma s'applique au démarrage ; une migration SQLite vers MariaDB est terminée **avant** le démarrage des collecteurs afin de conserver les identifiants des historiques.
 
 ## Sécurité
 
@@ -48,7 +58,11 @@ Le serveur web (Caddy) publie `https://monitor.clubika.com` vers `monitor-bridge
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest tests -q
+node --test tests/test_inventory_ui.js
 MONITOR_DATA=./data MONITOR_SECURE_COOKIE=0 MONITOR_ORIGIN=http://127.0.0.1:8000 .venv/bin/uvicorn app:app --port 8000
 ```
 
 - `app.py` : API et authentification ; `engine.py` : mesures de l'hôte, contrôles, incidents, notifications ; `static/` : interface.
+- `collector_runtime.py` et `host_collectors.py` : ordonnancement borné et collecteurs optionnels ; `inventory_store.py` : historique et migration ; `software_inventory.py` et `docker_topology.py` : adaptateurs spécialisés.
+- Les tests MariaDB réels nécessitent `MONITOR_MARIADB_TEST_SOCKET` pointant explicitement vers une instance **isolée** : ils créent et retirent une base de test aléatoire. Ils n'utilisent pas `MONITOR_DB` et refusent les chemins de sockets de production habituels.
+- Le test navigateur facultatif `tests/e2e_inventory.py` utilise un Chromium et Playwright déjà installés, avec `MONITOR_BROWSER_URL`, `MONITOR_BROWSER_DATA` et `MONITOR_BROWSER_ARTIFACTS` dédiés à une instance locale de test. Aucun téléchargement de navigateur automatique.

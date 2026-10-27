@@ -16,4 +16,5 @@ jobs:
       - run: python -m pytest tests -q
       - uses: actions/setup-node@v4
         with: { node-version: 24 }
-      - run: node --check static/app.js && node --check static/status.js
+      - run: node --check static/app.js && node --check static/inventory.js && node --check static/status.js
+      - run: node --test tests/test_inventory_ui.js

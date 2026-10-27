@@ -28,12 +28,23 @@ def client():
     for name in ('engine', 'app'):
         sys.modules.pop(name, None)
     app = importlib.import_module('app')
+    # This suite runs real collectors, but must never notify third parties or
+    # send probes to a hostname merely used as a CRUD fixture.
+    e = importlib.import_module('engine')
+    original_notify, original_check = e.notify, e.check
+    e.notify = lambda *args, **kwargs: None
+    def local_check(m):
+        if m['kind'] in {'http','keyword','json','tls','dns','ping'}:
+            return False, 0, 'External network disabled in tests', None
+        return original_check(m)
+    e.check = local_check
     with TestClient(app.app, base_url='http://testserver') as c:
         c.engine, c.module = importlib.import_module('engine'), app
         # Mot de passe écrit au premier démarrage dans le dossier de données.
         creds = (c.engine.DATA / 'admin-credentials.txt').read_text()
         c.password = [line.split(': ', 1)[1] for line in creds.splitlines() if line.startswith('Mot de passe')][0]
         yield c
+    e.notify, e.check = original_notify, original_check
 
 
 def login(client):

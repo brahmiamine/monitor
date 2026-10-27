@@ -3,7 +3,7 @@ import asyncio, csv, hashlib, hmac, io, ipaddress, json, os, re, secrets, socket
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
@@ -34,7 +34,15 @@ def bootstrap():
 def seed_monitors():
     """Premier démarrage : détecte les conteneurs Docker et le SSH du serveur et les surveille (modifiable ensuite dans l'interface)."""
     if e.rows('SELECT id FROM monitors LIMIT 1'): return
-    items=[dict(name='SSH',kind='tcp',target='127.0.0.1:22',group_name='Hébergement')]
+    items=[]
+    # First startup must not invent a service on machines without SSH.
+    if any(p['port']==22 and p['proto'].startswith('tcp') for p in e.listening_ports()):
+        for unit in ('ssh.service','sshd.service'):
+            try: active=e.run(['systemctl','is-active',unit]).strip()=='active'
+            except Exception: continue
+            if active:
+                items.append(dict(name='SSH',kind='tcp',target='127.0.0.1:22',group_name='Hébergement'))
+                break
     try:
         for line in e.run(['docker','ps','--format','{{.Names}}']).splitlines():
             if line.strip() and not line.startswith('monitor'): items.append(dict(name='Conteneur '+line.strip(),kind='docker',target=line.strip(),group_name='Conteneurs'))
@@ -47,7 +55,9 @@ def seed_monitors():
 
 @asynccontextmanager
 async def lifespan(app):
-    threads=e.start(); e.migrate_from_sqlite(os.environ.get('MONITOR_MIGRATE_FROM','')); bootstrap(); seed_monitors()
+    # A backend transfer must finish before collectors can allocate history IDs.
+    e.init(); e.migrate_from_sqlite(os.environ.get('MONITOR_MIGRATE_FROM','')); bootstrap(); seed_monitors()
+    threads=e.start()
     yield
     e.STOP.set()
     for t in threads: t.join(timeout=3)
@@ -366,6 +376,56 @@ def public_status():
 def software():
     """Paquets installés, environnements d'exécution, images Docker (liste volumineuse : hors du flux temps réel)."""
     return {**e.SOFTWARE,'updates':e.UPDATES}
+
+def inventory_snapshot():
+    if e.INVENTORY_RUNTIME is None:
+        return {'collected_at':None,'collectors':[],
+                'summary':{k:0 for k in ('available','unavailable','unsupported','error','pending')}}
+    return e.INVENTORY_RUNTIME.snapshot()
+
+@app.get('/api/inventory')
+def inventory():
+    # Collector output has already been JSON-validated. Avoid a second recursive
+    # FastAPI conversion of large installed-package/service inventories.
+    return JSONResponse(inventory_snapshot())
+
+@app.get('/api/inventory/history')
+def inventory_history(collector:str|None=Query(default=None,pattern=r'^[a-z][a-z0-9_.-]{0,79}$'),limit:int=Query(default=100,ge=1,le=200)):
+    return e.INVENTORY_STORE.history(collector,limit=limit)
+
+@app.get('/api/inventory/changes')
+def inventory_changes(collector:str|None=Query(default=None,pattern=r'^[a-z][a-z0-9_.-]{0,79}$'),limit:int=Query(default=100,ge=1,le=200)):
+    return e.INVENTORY_STORE.changes(collector,limit=limit)
+
+@app.get('/api/inventory/metrics')
+def inventory_metrics(collector:str=Query(pattern=r'^[a-z][a-z0-9_.-]{0,79}$'),hours:int=Query(default=24,ge=1,le=720)):
+    try: return e.INVENTORY_STORE.metrics(collector,hours=hours)
+    except ValueError: raise HTTPException(422,'Période de métriques invalide')
+
+@app.get('/api/inventory/relations')
+def inventory_relations(collector:str|None=Query(default=None,pattern=r'^[a-z][a-z0-9_.-]{0,79}$')):
+    return e.INVENTORY_STORE.relations(collector)
+
+@app.get('/api/inventory/compare')
+def inventory_compare(before:int=Query(ge=1),after:int=Query(ge=1)):
+    try: return e.INVENTORY_STORE.compare(before,after)
+    except LookupError: raise HTTPException(404,'Inventaire historique introuvable')
+    except ValueError: raise HTTPException(422,'Choisissez deux inventaires du même collecteur')
+
+@app.get('/api/inventory/export')
+def inventory_export(format:str=Query(default='json',pattern=r'^(json|csv)$')):
+    value=inventory_snapshot()
+    if format=='json':
+        return Response(json.dumps(value,ensure_ascii=False,allow_nan=False),media_type='application/json',
+                        headers={'Content-Disposition':'attachment; filename="monitor-inventory.json"'})
+    output=io.StringIO(); writer=csv.writer(output)
+    writer.writerow(['collecteur','categorie','statut','derniere_reussite','perime','raison','donnees'])
+    def cell(v):
+        text=str(v if v is not None else '')
+        return "'"+text if text[:1] in '=+-@\t\r\n' else text
+    for row in value['collectors']:
+        writer.writerow([cell(v) for v in (row['id'],row['category'],row['status'],row['last_success'],row['stale'],row['reason'],json.dumps(row['data'],ensure_ascii=False))])
+    return Response(output.getvalue(),media_type='text/csv',headers={'Content-Disposition':'attachment; filename="monitor-inventory.csv"'})
 
 @app.get('/api/config')
 def config():
