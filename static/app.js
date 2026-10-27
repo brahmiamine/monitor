@@ -347,7 +347,7 @@ let source = null;
 function showLogin() { source?.close(); $('#shell').hidden = true; $('#login').hidden = false; }
 function connect() {
   source?.close(); source = new EventSource('/api/stream');
-  source.onmessage = (ev) => { S.live = JSON.parse(ev.data); S.last = Date.now(); $('#stale-banner').hidden = true; $('#connection').lastChild.textContent = ' En direct'; $('#host-label').textContent = S.live.hostname || 'Serveur'; liveRender(); };
+  source.onmessage = (ev) => { S.live = JSON.parse(ev.data); S.last = Date.now(); $('#stale-banner').hidden = !S.live.stale; $('#connection').lastChild.textContent = S.live.stale ? ' Mesures périmées' : ' En direct'; $('#host-label').textContent = S.live.hostname || 'Serveur'; liveRender(); };
   source.onerror = () => { $('#connection').lastChild.textContent = ' Reconnexion…'; };
 }
 function branding(cfg) {
@@ -362,7 +362,7 @@ async function start() {
   await loadMonitors(); connect(); await go();
   setInterval(async () => { if (!document.hidden) { await loadMonitors(); if (['monitors', 'incidents'].includes(S.page) && !$('#dialog').open) render(); } }, 15000);
   setInterval(async () => { if (!document.hidden && (S.page === 'overview' || S.page === 'server')) { await loadHistory(); } }, 30000);
-  setInterval(() => { $('#clock').textContent = new Date().toLocaleTimeString('fr-FR'); const stale = S.last && Date.now() - S.last > 10000; $('#stale-banner').hidden = !stale; $('#sidebar-dot').classList.toggle('bad', !!stale); }, 1000);
+  setInterval(() => { $('#clock').textContent = new Date().toLocaleTimeString('fr-FR'); const stale = (S.last && Date.now() - S.last > 10000) || S.live?.stale; $('#stale-banner').hidden = !stale; $('#sidebar-dot').classList.toggle('bad', !!stale); }, 1000);
 }
 $('#login-form').addEventListener('submit', async (ev) => {
   ev.preventDefault(); const d = new FormData(ev.target); $('#login-error').textContent = '';

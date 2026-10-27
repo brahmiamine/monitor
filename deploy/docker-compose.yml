@@ -1,6 +1,6 @@
 # Deux petits conteneurs sans privilèges autour du service système :
 #  - docker-proxy : liste des conteneurs et statistiques en lecture seule, publié uniquement sur 127.0.0.1:2375 ;
-#  - bridge : relie Caddy (réseau Docker clubika_internal) au socket Unix de l'application.
+#  - bridge : expose le socket Unix sur un réseau Docker dédié ; y connecter le reverse proxy.
 name: monitor
 
 services:
@@ -26,8 +26,8 @@ services:
     volumes:
       - /var/lib/monitor/run:/run/monitor
     networks:
-      - clubika_internal
+      - monitor_proxy
 
 networks:
-  clubika_internal:
-    external: true
+  monitor_proxy:
+    name: ${MONITOR_PROXY_NETWORK:-monitor_proxy}

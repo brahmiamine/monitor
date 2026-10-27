@@ -86,6 +86,9 @@ CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,expires REAL NOT NULL
 CREATE TABLE IF NOT EXISTS heartbeats(monitor_id INTEGER PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE,ts REAL,ok INTEGER,message TEXT);
 CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY,name TEXT NOT NULL,url TEXT DEFAULT '',repo_url TEXT DEFAULT '',
   container TEXT DEFAULT '',repo_dir TEXT DEFAULT '',description TEXT DEFAULT '',created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS notification_jobs(id INTEGER PRIMARY KEY,channel TEXT NOT NULL,title TEXT NOT NULL,message TEXT NOT NULL,
+  created REAL NOT NULL,due REAL NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'pending',last_error TEXT DEFAULT '');
+CREATE INDEX IF NOT EXISTS notification_due ON notification_jobs(status,due);
 '''
 MARIA_SCHEMA = [
  "CREATE TABLE IF NOT EXISTS settings(`key` VARCHAR(64) PRIMARY KEY,value MEDIUMTEXT NOT NULL)",
@@ -102,6 +105,9 @@ MARIA_SCHEMA = [
  "CREATE TABLE IF NOT EXISTS heartbeats(monitor_id INT PRIMARY KEY,ts DOUBLE,ok TINYINT,message TEXT,CONSTRAINT heartbeats_monitor_fk FOREIGN KEY(monitor_id) REFERENCES monitors(id) ON DELETE CASCADE)",
  "CREATE TABLE IF NOT EXISTS projects(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,url VARCHAR(500) DEFAULT '',repo_url VARCHAR(500) DEFAULT '',"
  "container VARCHAR(100) DEFAULT '',repo_dir VARCHAR(255) DEFAULT '',description VARCHAR(500) DEFAULT '',created DOUBLE NOT NULL)",
+ "CREATE TABLE IF NOT EXISTS notification_jobs(id BIGINT AUTO_INCREMENT PRIMARY KEY,channel VARCHAR(24) NOT NULL,title VARCHAR(255) NOT NULL,"
+ "message TEXT NOT NULL,created DOUBLE NOT NULL,due DOUBLE NOT NULL,attempts INT NOT NULL DEFAULT 0,status VARCHAR(16) NOT NULL DEFAULT 'pending',"
+ "last_error VARCHAR(120) NOT NULL DEFAULT '',KEY notification_due(status,due))",
 ]
 
 def init():
@@ -147,36 +153,69 @@ def run(args, timeout=8):
         raise RuntimeError((p.stderr or p.stdout or 'Commande indisponible')[:180])
     return p.stdout
 
-def notify(title, message):
-    s = settings()
-    text = f'{title}\n{message}' + (f'\n{ORIGIN}' if ORIGIN else '')
+def notification_channels(s):
+    channels=[]
+    if s.get('webhook_url'): channels.append('webhook')
+    if s.get('telegram_token') and s.get('telegram_chat'): channels.append('telegram')
+    if s.get('smtp_host') and s.get('smtp_to'): channels.append('email')
+    return channels
+
+def enqueue_notification(title, message):
+    """Persist each delivery before it is attempted; survive a monitor restart."""
+    now=time.time(); channels=notification_channels(settings())
+    with db() as c:
+        for channel in channels:
+            c.execute('INSERT INTO notification_jobs(channel,title,message,created,due) VALUES (?,?,?,?,?)',
+                      (channel,title[:255],message[:4000],now,now))
+    return len(channels)
+
+def send_notification(channel, title, message):
+    """True only after the channel confirms delivery; never record secret-bearing errors."""
+    s=settings()
+    text=f'{title}\n{message}' + (f'\n{ORIGIN}' if ORIGIN else '')
     import smtplib
     from email.message import EmailMessage
-    channels = []
-    if s['webhook_url']: channels.append(('webhook',lambda: httpx.post(s['webhook_url'],json={'title':title,'message':message},timeout=10).raise_for_status()))
-    if s['telegram_token'] and s['telegram_chat']:
-        channels.append(('Telegram',lambda: httpx.post(f'https://api.telegram.org/bot{s["telegram_token"]}/sendMessage',json={'chat_id':s['telegram_chat'],'text':text},timeout=10).raise_for_status()))
-    def email():
-        msg = EmailMessage(); msg['Subject']=title; msg['From']=s['smtp_from']; msg['To']=s['smtp_to']; msg.set_content(text)
-        with smtplib.SMTP(s['smtp_host'], int(s['smtp_port']), timeout=10) as smtp:
-            smtp.starttls(context=ssl.create_default_context())
-            if s['smtp_user']: smtp.login(s['smtp_user'],s['smtp_password'])
-            smtp.send_message(msg)
-    if s['smtp_host'] and s['smtp_to']: channels.append(('e-mail',email))
-    for name,fn in channels:
-        try:
-            fn(); event('notification', f'Alerte transmise : {name}')
-        except Exception:
-            # Never persist exceptions containing notification tokens or credentials.
-            log.warning('Notification failed: %s',name)
-            event('notification_error',f'Échec d’envoi : {name}. Vérifiez la configuration.')
+    try:
+        if channel == 'webhook' and s['webhook_url']:
+            httpx.post(s['webhook_url'],json={'title':title,'message':message},timeout=10).raise_for_status()
+        elif channel == 'telegram' and s['telegram_token'] and s['telegram_chat']:
+            httpx.post(f'https://api.telegram.org/bot{s["telegram_token"]}/sendMessage',
+                       json={'chat_id':s['telegram_chat'],'text':text},timeout=10).raise_for_status()
+        elif channel == 'email' and s['smtp_host'] and s['smtp_to']:
+            msg=EmailMessage(); msg['Subject']=title; msg['From']=s['smtp_from']; msg['To']=s['smtp_to']; msg.set_content(text)
+            if int(s['smtp_port'])==465:
+                smtp=smtplib.SMTP_SSL(s['smtp_host'],465,timeout=10,context=ssl.create_default_context())
+            else:
+                smtp=smtplib.SMTP(s['smtp_host'],int(s['smtp_port']),timeout=10)
+            with smtp:
+                if int(s['smtp_port'])!=465: smtp.starttls(context=ssl.create_default_context())
+                if s['smtp_user']: smtp.login(s['smtp_user'],s['smtp_password'])
+                smtp.send_message(msg)
+        else:
+            return False
+        return True
+    except Exception:
+        log.warning('Notification failed on channel %s',channel)
+        return False
 
-NOTIFICATIONS = queue.Queue(maxsize=100)
 def notification_worker():
     while not STOP.is_set():
-        try: title,message=NOTIFICATIONS.get(timeout=1)
-        except queue.Empty: continue
-        notify(title,message)
+        try:
+            jobs=rows("SELECT * FROM notification_jobs WHERE status='pending' AND due<=? ORDER BY due,id LIMIT 20",(time.time(),))
+            for job in jobs:
+                ok=send_notification(job['channel'],job['title'],job['message'])
+                tries=job['attempts']+1
+                state='sent' if ok else ('failed' if tries>=8 else 'pending')
+                due=time.time() + min(3600,30*(2**(tries-1)))
+                with db() as c:
+                    c.execute('UPDATE notification_jobs SET status=?,attempts=?,due=?,last_error=? WHERE id=? AND status=?',
+                              (state,tries,due,'' if ok else 'Échec de livraison',job['id'],'pending'))
+                if ok: event('notification','Alerte transmise : '+job['channel'])
+                elif state=='failed': event('notification_error','Livraison abandonnée après 8 essais : '+job['channel'])
+        except Exception:
+            log.exception('Notification worker failed')
+        STOP.wait(3)
+
 
 def incident(source, active, title, message):
     changed = False
@@ -188,8 +227,7 @@ def incident(source, active, title, message):
             c.execute('UPDATE incidents SET closed=?,is_open=NULL WHERE id=?',(time.time(),current['id'])); changed=True
     if changed:
         event('incident' if active else 'recovery',title)
-        try: NOTIFICATIONS.put_nowait((('Incident : ' if active else 'Rétabli : ')+title,message))
-        except queue.Full: event('notification_error','File de notifications saturée')
+        enqueue_notification(('Incident : ' if active else 'Rétabli : ')+title,message)
 
 def host_file(path, default=''):
     try: return (Path(HOST_ROOT + path)).read_text().strip()
@@ -366,7 +404,7 @@ def collect_services():
     """Services systemd : `systemctl` d'abord ; à défaut (conteneur), les services en cours lus dans les cgroups."""
     try:
         lines=run(['systemctl','list-units','--type=service','--all','--no-pager','--no-legend','--plain']).splitlines()
-    except FileNotFoundError:
+    except (FileNotFoundError, RuntimeError):
         dirs=service_dirs()
         if not dirs: raise RuntimeError('cgroups indisponibles')
         return [service_info(p) for p in dirs]
@@ -591,12 +629,22 @@ def system_alerts(system):
         incident('system:inodes:'+i['mount'],i['percent']>=limit,'Inodes : '+i['mount'],f"{i['percent']} % utilisés")
 
 def inventory():
-    system_at=0; updates_at=0
+    system_at=0; updates_at=0; previous_restarts={}
     while not STOP.is_set():
         for key,fn in [('containers',collect_docker),('services',collect_services)]:
             try:
                 value=fn()
                 with LOCK: CACHE[key]=value; CACHE['errors'].pop(key,None)
+                if key=='containers':
+                    for ctr in value:
+                        name=ctr['name']; state=ctr['state']; health=ctr.get('health')
+                        bad=state in ('exited','dead','restarting') or health=='unhealthy' or ctr.get('oom',False)
+                        incident('docker:'+name,bad,'Docker : '+name,
+                                 'État : '+state+' ; santé : '+str(health or 'non définie')+(' ; OOM' if ctr.get('oom') else ''))
+                        previous=previous_restarts.get(name)
+                        if previous is not None and ctr.get('restarts',0)>previous:
+                            event('docker','Redémarrage du conteneur '+name)
+                        previous_restarts[name]=ctr.get('restarts',0)
             except Exception:
                 with LOCK: CACHE['errors'][key]='Collecte indisponible : vérifier les permissions du service.'
         if time.time()-system_at>=30:
@@ -662,6 +710,7 @@ def collect():
                 cutoff=now-settings()['retention_days']*86400
                 with db() as c:
                     for table,col in [('samples','ts'),('checks','ts'),('events','ts')]: c.execute(f'DELETE FROM {table} WHERE {col}<?',(cutoff,))
+                    c.execute("DELETE FROM notification_jobs WHERE status IN ('sent','failed') AND created<?",(cutoff,))
                     c.execute('DELETE FROM sessions WHERE expires<?',(now,))
                 cleanup=now
         except Exception:

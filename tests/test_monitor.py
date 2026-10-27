@@ -228,3 +228,31 @@ def test_system_info_has_storage_and_network_details(client):
     info = client.engine.CACHE['system']
     assert info['filesystems'] and all({'mount', 'fstype', 'total', 'percent'} <= set(f) for f in info['filesystems'])
     assert isinstance(info['disk_io'], list) and isinstance(info['block_devices'], list)
+
+
+def test_durable_notification_queue_and_delivery(client, monkeypatch):
+    e=client.engine
+    monkeypatch.setattr(e,'send_notification',lambda channel,title,message: True)
+    before=e.rows('SELECT COUNT(*) AS n FROM notification_jobs')[0]['n']
+    with e.db() as c:
+        c.execute("UPDATE settings SET value=? WHERE `key`='webhook_url'", ('"https://example.org/hooks"',))
+    assert e.enqueue_notification('Test durable','Message') >= 1
+    jobs=e.rows('SELECT * FROM notification_jobs ORDER BY id DESC LIMIT 1')
+    assert len(jobs)==1 and jobs[0]['status']=='pending'
+    # With a live worker, a job transitions from pending to sent.
+    deadline=time.time()+8
+    while time.time()<deadline:
+        if e.rows('SELECT status FROM notification_jobs WHERE id=?',(jobs[0]['id'],))[0]['status']=='sent': break
+        time.sleep(.2)
+    assert e.rows('SELECT status FROM notification_jobs WHERE id=?',(jobs[0]['id'],))[0]['status']=='sent'
+    with e.db() as c: c.execute("UPDATE settings SET value=? WHERE `key`='webhook_url'", ('""',))
+
+
+def test_health_detects_stale_samples(client):
+    login(client)
+    e=client.engine
+    with e.LOCK:
+        original=e.LIVE.get('ts',0)
+        e.LIVE['ts']=time.time()-60
+        assert client.get('/healthz').status_code==503
+        e.LIVE['ts']=original

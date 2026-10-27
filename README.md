@@ -41,7 +41,7 @@ Accès réservé à un administrateur : mot de passe haché (PBKDF2), session pa
 - `monitor-docker-proxy` : liste des conteneurs, images, volumes et statistiques **en lecture seule**, publiée uniquement sur `127.0.0.1` ;
 - `monitor-bridge` : relie Caddy au socket Unix de l'application.
 
-Le serveur web (Caddy) publie `https://monitor.clubika.com` vers `monitor-bridge:8000`. Mises à jour : `deploy/update.sh` (copie, dépendances, redémarrage, test de santé) ; le déploiement automatique du serveur l'exécute à chaque commit sur `main`.
+Le reverse proxy (Caddy, Traefik, Nginx…) se connecte au réseau Docker `${MONITOR_PROXY_NETWORK:-monitor_proxy}` (créé automatiquement par Compose) et transmet vers `monitor-bridge:8000`. Exemple pour Caddy dans un autre conteneur : `docker network connect monitor_proxy NOM_DU_CONTENEUR_CADDY`, puis `reverse_proxy monitor-bridge:8000`. **L'installation ne suppose plus de réseau `clubika_internal`**, de domaine ou de conteneur de proxy prédéfini. Ce raccordement au proxy reste une étape à configurer selon le serveur. Mises à jour : `deploy/update.sh` (copie, dépendances, redémarrage, test de santé) ; le déploiement automatique du serveur l'exécute à chaque commit sur `main`.
 
 ## Développement
 
@@ -52,3 +52,10 @@ MONITOR_DATA=./data MONITOR_SECURE_COOKIE=0 MONITOR_ORIGIN=http://127.0.0.1:8000
 ```
 
 - `app.py` : API et authentification ; `engine.py` : mesures de l'hôte, contrôles, incidents, notifications ; `static/` : interface.
+
+## Fiabilité des alertes
+
+Les envois Telegram, webhook et SMTP (STARTTLS ou TLS direct/465) sont enregistrés dans `notification_jobs` avant transmission. En cas d'échec, chaque canal est retenté avec un délai croissant (8 essais maximum), même après redémarrage. Les livraisons sont consultables via `/api/notifications/deliveries` (authentifié). Le contrôle `/healthz` renvoie HTTP 503 si les métriques sont anciennes ou si un collecteur Docker/systemd échoue. Un contrôle **hors du VPS** est indispensable pour détecter l'arrêt complet de la machine.
+
+Les conteneurs arrêtés, en redémarrage, marqués unhealthy ou OOM déclenchent des incidents dédiés. Évitez de maintenir des conteneurs volontairement arrêtés sans maintenance lorsque les alertes Docker sont actives.
+

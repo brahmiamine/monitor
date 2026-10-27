@@ -119,7 +119,10 @@ def password(body:Password):
 @app.get('/healthz')
 def health():
     age=time.time()-e.LIVE.get('ts',0)
-    return JSONResponse({'status':'ok' if age<15 else 'starting'},200 if age<15 else 503)
+    collectors=e.CACHE.get('errors',{})
+    healthy=age<15 and not collectors
+    return JSONResponse({'status':'ok' if healthy else 'degraded','sample_age_seconds':round(age,1),
+        'collectors':collectors},200 if healthy else 503)
 
 @app.get('/api/live')
 def live():
@@ -131,6 +134,7 @@ async def stream(request:Request):
         start=time.time()
         while not await request.is_disconnected() and time.time()-start<3600:
             with e.LOCK: data={**e.LIVE,**e.CACHE}
+            data['stale']=time.time()-data.get('ts',0)>15
             yield 'data: '+json.dumps(data)+'\n\n'
             await asyncio.sleep(2)
     return StreamingResponse(events(),media_type='text/event-stream',headers={'X-Accel-Buffering':'no'})
@@ -289,8 +293,13 @@ def set_settings(body:Settings):
 
 @app.post('/api/notifications/test')
 def test_notifications():
-    e.NOTIFICATIONS.put_nowait(('Test Monitor Clubika','Votre canal de notification est configuré.'))
-    return {'ok':True,'message':'Test en file d’envoi. Résultat dans le journal.'}
+    count=e.enqueue_notification('Test Monitor','Canal de notification en cours de vérification.')
+    return {'ok':bool(count),'message':f'{count} notification(s) enregistrée(s) pour envoi. Consultez le journal.'}
+
+@app.get('/api/notifications/deliveries')
+def notification_deliveries():
+    return e.rows('SELECT id,channel,created,due,attempts,status,last_error FROM notification_jobs ORDER BY id DESC LIMIT 100')
+
 
 @app.get('/api/export')
 def export():
