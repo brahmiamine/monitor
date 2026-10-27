@@ -188,7 +188,7 @@ const PAGES = {
     const l = S.live; if (!l?.ts) return '<div class="empty">Chargement…</div>';
     if (l.errors?.containers) return `<div class="notice error">${esc(l.errors.containers)}</div>`;
     const since = (c) => (c.state === 'running' && c.started ? dur(Date.now() / 1000 - Date.parse(c.started) / 1000) : '—');
-    return panel('Conteneurs Docker', table(['Nom', 'Image', 'État', 'Santé', 'En ligne depuis', 'Redém.', 'Ports', 'CPU', 'Mémoire', 'Réseau', 'Disque'], (l.containers || []).map((c) => `<tr><td><strong>${esc(c.name)}</strong>${c.compose ? `<small>${esc(c.compose)}</small>` : ''}</td><td>${esc(c.image)}</td><td>${badge(c.state === 'running' ? '' : 'down', c.state)}</td><td>${c.health ? badge(c.health === 'healthy' ? '' : 'down', c.health) : '—'}</td><td>${since(c)}</td><td>${c.restarts || 0}${c.oom ? ' · OOM' : ''}</td><td class="log-message">${esc((c.ports || []).join(', ') || '—')}</td><td>${esc(c.cpu)}</td><td>${esc(c.memory)}</td><td>${esc(c.network)}</td><td>${esc(c.io)}</td></tr>`), 'Aucun conteneur détecté.'), { note: 'Mesures prises toutes les 10 secondes' });
+    return panel('Conteneurs Docker', table(['Nom', 'Image', 'État', 'Santé', 'En ligne depuis', 'Redém.', 'Ports', 'CPU', 'Mémoire', 'Réseau', 'Disque', 'Logs'], (l.containers || []).map((c) => `<tr><td><strong>${esc(c.name)}</strong>${c.compose ? `<small>${esc(c.compose)}</small>` : ''}</td><td>${esc(c.image)}</td><td>${badge(c.state === 'running' ? '' : 'down', c.state)}</td><td>${c.health ? badge(c.health === 'healthy' ? '' : 'down', c.health) : '—'}</td><td>${since(c)}</td><td>${c.restarts || 0}${c.oom ? ' · OOM' : ''}</td><td class="log-message">${esc((c.ports || []).join(', ') || '—')}</td><td>${esc(c.cpu)}</td><td>${esc(c.memory)}</td><td>${esc(c.network)}</td><td>${esc(c.io)}</td><td><button data-logs="${esc(c.name)}">Voir</button></td></tr>`), 'Aucun conteneur détecté.'), { note: 'Mesures prises toutes les 10 secondes' });
   } },
 
   services: { title: 'Services système', desc: 'Services systemd en cours d’exécution sur le serveur.', live: true, render() {
@@ -217,6 +217,18 @@ const PAGES = {
     return panel('200 derniers événements', table(['Date', 'Type', 'Message'], events.map((x) => `<tr><td>${stamp(x.ts)}</td><td>${esc(x.kind)}</td><td class="log-message">${esc(x.message)}</td></tr>`), 'Aucun événement.'));
   } },
 
+  database: { title: 'Base de données', desc: 'Connectivité et volume des données du moteur.', async render() {
+    const d=await api('/api/database');
+    const meta=panel('Connexion',`<div class="spec-list"><div><span>Moteur</span><strong>${esc(d.engine)}</strong></div><div><span>État</span><strong>${d.ok?'Disponible':'Indisponible'}</strong></div><div><span>Latence</span><strong>${d.latency_ms} ms</strong></div><div><span>Fichier</span><strong>${d.size_bytes==null?'—':bytes(d.size_bytes)}</strong></div></div>`);
+    const values=panel('Enregistrements',table(['Table','Nombre'],Object.entries(d.rows).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v.toLocaleString('fr-FR')}</td></tr>`)));
+    const stats=panel('Indicateurs',table(['Indicateur','Valeur'],Object.entries(d.status||{}).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`)));
+    return meta+values+stats;
+  } },
+  sla: { title: 'Rapports de disponibilité', desc: 'Temps réellement observé sur chaque période.', async render() {
+    const d=await api('/api/sla?days='+(S.slaDays||30));
+    return `<div class="toolbar">${[1,7,30,90].map(n=>`<button data-sla-days="${n}" class="${d.days===n?'primary':''}">${n} j</button>`).join('')}</div>`+
+      panel('Temps de disponibilité',table(['Contrôle','Disponible','Couverture','Panne cumulée'],d.monitors.map(m=>`<tr><td>${esc(m.name)}</td><td><strong>${m.availability==null?'—':m.availability+' %'}</strong></td><td>${m.coverage} %</td><td>${dur(m.down_seconds)}</td></tr>`)));
+  } },
   settings: { title: 'Paramètres', desc: 'Seuils d’alerte, notifications, sauvegarde et sécurité.', async render() {
     const s = S.settings = await api('/api/settings');
     const f = (name, label, type = 'text', extra = '') => `<label>${label}<input name="${name}" type="${type}" value="${esc(s[name])}" ${extra}></label>`;
@@ -297,10 +309,11 @@ function projectForm(p = {}) {
     <label>Conteneur Docker<input name="container" value="${esc(p.container)}" placeholder="nom-du-conteneur" pattern="[A-Za-z0-9_.\-]*"></label>
     <label>Dossier de déploiement (facultatif)<input name="repo_dir" value="${esc(p.repo_dir)}" pattern="[A-Za-z0-9_.\-]*"></label>
     <label class="full">Description<input name="description" value="${esc(p.description)}" maxlength="500"></label>
+    <fieldset class="full"><legend>Contrôles rattachés au projet</legend>${S.monitors.map(m=>`<label class="check-label"><input type="checkbox" name="monitor_ids" value="${m.id}" ${p.monitor_ids?.includes(m.id)?'checked':''} style="width:auto;min-height:0"> ${esc(m.name)} (${esc(m.kind)})</label>`).join('')||'Aucun contrôle disponible.'}</fieldset>
     <p class="error full" id="form-error" role="alert"></p><div class="form-actions full"><button class="primary" type="submit">Enregistrer</button><button type="button" id="cancel">Annuler</button></div></form>`);
   $('#cancel').onclick = () => $('#dialog').close();
   $('#project-form').onsubmit = async (ev) => {
-    ev.preventDefault(); const d = Object.fromEntries(new FormData(ev.target));
+    ev.preventDefault(); const formData=new FormData(ev.target), d=Object.fromEntries(formData); d.monitor_ids=formData.getAll('monitor_ids').map(Number);
     try { await api(p.id ? `/api/projects/${p.id}` : '/api/projects', { method: p.id ? 'PUT' : 'POST', body: d }); $('#dialog').close(); render(); toast('Projet enregistré'); }
     catch (e) { $('#form-error').textContent = e.message; }
   };
@@ -312,6 +325,8 @@ document.addEventListener('click', async (ev) => {
   try {
     if (t.dataset.manual) { S.manualOnly = !S.manualOnly; render(); }
     else if (t.dataset.hours) { S.hours = +t.dataset.hours; await loadHistory(); render(); }
+    else if (t.dataset.slaDays) { S.slaDays = +t.dataset.slaDays; render(); }
+    else if (t.dataset.logs) { const data=await api('/api/containers/'+encodeURIComponent(t.dataset.logs)+'/logs?tail=150'); openDialog('Logs Docker : '+data.name, '<pre class="log-view">'+esc(data.logs)+'</pre>'); }
     else if (t.dataset.detail) await showDetail(+t.dataset.detail);
     else if (t.dataset.check || t.dataset.pause) { const id = +(t.dataset.check || t.dataset.pause); await api(`/api/monitors/${id}/action`, { method: 'POST', body: { action: t.dataset.check ? 'check' : 'pause' } }); toast(t.dataset.check ? 'Vérification lancée' : 'Contrôle mis à jour'); setTimeout(async () => { await loadMonitors(); render(); }, t.dataset.check ? 2500 : 200); }
     else if (t.dataset.ack) { await api(`/api/incidents/${t.dataset.ack}/ack`, { method: 'POST' }); await loadMonitors(); render(); }
@@ -376,3 +391,5 @@ $('#theme').addEventListener('click', () => { const dark = document.documentElem
 try { const t = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); document.documentElement.dataset.theme = t; } catch { /* thème clair par défaut */ }
 window.addEventListener('hashchange', go);
 decorate(); start();
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/static/sw.js').catch(()=>{});

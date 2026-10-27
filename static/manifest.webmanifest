@@ -1,0 +1,18 @@
+{
+  "name": "Monitor - Supervision autonome",
+  "short_name": "Monitor",
+  "lang": "fr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#113a35",
+  "theme_color": "#113a35",
+  "icons": [
+    {
+      "src": "/static/mark.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
