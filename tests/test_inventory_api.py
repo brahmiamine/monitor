@@ -163,3 +163,26 @@ def test_transfer_completes_before_background_threads_start(inventory_client, mo
     monkeypatch.setattr(e,'start',lambda:(calls.append('start') or []))
     with TestClient(module.app): pass
     assert calls.index('transfer') < calls.index('start')
+
+
+def test_unknown_docker_details_do_not_close_existing_alert(inventory_client):
+    _,e=inventory_client
+    e.incident('docker:test',True,'Docker : test','Previously unhealthy')
+    row={'name':'test','state':'running','health':None,'oom':None,'restarts':None,'details_status':'unavailable'}
+    e.docker_alerts([row])
+    assert e.rows("SELECT id FROM incidents WHERE source='docker:test' AND is_open=1")
+    e.docker_alerts([{**row,'details_status':'available','health':'healthy','oom':False,'restarts':0}])
+    assert not e.rows("SELECT id FROM incidents WHERE source='docker:test' AND is_open=1")
+
+
+def test_health_distinguishes_absent_optional_tools_and_failed_collectors(inventory_client):
+    from types import SimpleNamespace
+    client,e=inventory_client
+    e.LIVE['ts']=time.time();e.CACHE['errors']={'containers':'Outil optionnel absent : docker'}
+    e.INVENTORY_RUNTIME=SimpleNamespace(snapshot=lambda:{'collectors':[
+        {'id':'containers','status':'unavailable','last_success':None}]})
+    response=client.get('/healthz')
+    assert response.status_code==200 and response.json()['status']=='degraded'
+    e.INVENTORY_RUNTIME=SimpleNamespace(snapshot=lambda:{'collectors':[
+        {'id':'containers','status':'error','last_success':time.time()-20}]})
+    assert client.get('/healthz').status_code==503

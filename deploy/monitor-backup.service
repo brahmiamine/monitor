@@ -1,0 +1,17 @@
+[Unit]
+Description=Monitor daily database backup
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=monitor
+Group=monitor
+WorkingDirectory=/opt/monitor/app
+Environment=MONITOR_DATA=/var/lib/monitor
+EnvironmentFile=-/etc/monitor.env
+ExecStart=/opt/monitor/venv/bin/python /opt/monitor/app/backup_util.py
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/monitor

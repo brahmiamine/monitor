@@ -129,7 +129,16 @@ def password(body:Password):
 @app.get('/healthz')
 def health():
     age=time.time()-e.LIVE.get('ts',0)
-    return JSONResponse({'status':'ok' if age<15 else 'starting'},200 if age<15 else 503)
+    collectors=e.CACHE.get('errors',{})
+    optional=set()
+    if e.INVENTORY_RUNTIME is not None:
+        names={'host_system':'system','containers':'containers','services':'services'}
+        for row in e.INVENTORY_RUNTIME.snapshot()['collectors']:
+            if row['status'] in ('unavailable','unsupported') and row['last_success'] is None:
+                optional.add(names.get(row['id'],row['id']))
+    ready=age<15 and not (set(collectors)-optional)
+    return JSONResponse({'status':'ok' if ready and not collectors else 'degraded','sample_age_seconds':round(age,1),
+        'collectors':collectors,'optional_collectors':sorted(set(collectors)&optional)},200 if ready else 503)
 
 @app.get('/api/live')
 def live():
@@ -141,6 +150,7 @@ async def stream(request:Request):
         start=time.time()
         while not await request.is_disconnected() and time.time()-start<3600:
             with e.LOCK: data={**e.LIVE,**e.CACHE}
+            data['stale']=time.time()-data.get('ts',0)>15
             yield 'data: '+json.dumps(data)+'\n\n'
             await asyncio.sleep(2)
     return StreamingResponse(events(),media_type='text/event-stream',headers={'X-Accel-Buffering':'no'})
@@ -299,8 +309,13 @@ def set_settings(body:Settings):
 
 @app.post('/api/notifications/test')
 def test_notifications():
-    e.NOTIFICATIONS.put_nowait(('Test Monitor Clubika','Votre canal de notification est configuré.'))
-    return {'ok':True,'message':'Test en file d’envoi. Résultat dans le journal.'}
+    count=e.enqueue_notification('Test Monitor','Canal de notification en cours de vérification.')
+    return {'ok':bool(count),'message':f'{count} notification(s) enregistrée(s) pour envoi. Consultez le journal.'}
+
+@app.get('/api/notifications/deliveries')
+def notification_deliveries():
+    return e.rows('SELECT id,channel,created,due,attempts,status,last_error FROM notification_jobs ORDER BY id DESC LIMIT 100')
+
 
 @app.get('/api/export')
 def export():
@@ -322,9 +337,11 @@ class Project(BaseModel):
     container:str=Field(default='',max_length=100,pattern=r'^[A-Za-z0-9_.\-]*$')
     repo_dir:str=Field(default='',max_length=100,pattern=r'^[A-Za-z0-9_.\-]*$')
     description:str=Field(default='',max_length=500)
+    monitor_ids:list[int]=Field(default_factory=list,max_length=200)
     @model_validator(mode='after')
     def valid(self):
         self.name=self.name.strip(); self.url=web_url(self.url.strip()); self.repo_url=web_url(self.repo_url.strip())
+        if any(x<1 for x in self.monitor_ids) or len(set(self.monitor_ids))!=len(self.monitor_ids): raise ValueError('Identifiants de contrôles invalides')
         return self
 
 class Import(BaseModel):
@@ -340,7 +357,7 @@ def import_monitors(body:Import):
             c.execute('INSERT INTO monitors('+','.join('`'+k+'`' for k in v)+') VALUES ('+','.join('?' for _ in v)+')',tuple(v.values()))
     with e.db() as c:
         for p in body.projects:
-            v=p.model_dump(); v['created']=time.time()
+            v=p.model_dump(exclude={'monitor_ids'}); v['created']=time.time()
             c.execute('INSERT INTO projects('+','.join(v)+') VALUES ('+','.join('?' for _ in v)+')',tuple(v.values()))
     return {'ok':True,'imported':len(body.monitors)+len(body.projects)}
 
@@ -442,26 +459,38 @@ def projects():
     items=e.rows('SELECT * FROM projects ORDER BY name'); ms=e.monitors()
     with e.LOCK: containers={c['name']:c for c in e.CACHE['containers']}
     for p in items:
+        p['monitor_ids']=[r['monitor_id'] for r in e.rows('SELECT monitor_id FROM project_monitors WHERE project_id=?',(p['id'],))]
         host=urlsplit(p['url']).hostname if p['url'] else None
-        linked=[m for m in ms if (host and urlsplit(m['target']).hostname==host) or (p['container'] and m['kind']=='docker' and m['target']==p['container'])]
+        linked=[m for m in ms if m['id'] in p['monitor_ids']]
+        if not p['monitor_ids']:
+            linked=[m for m in ms if (host and urlsplit(m['target']).hostname==host) or (p['container'] and m['kind']=='docker' and m['target']==p['container'])]
         p['monitors']=[{'id':m['id'],'name':m['name'],'ok':m['ok'],'paused':m['paused'],'latency':m['latency'],'uptime':m['uptime'],'tls_days':m['tls_days']} for m in linked]
         p['container_info']=containers.get(p['container'])
         p['deploy']=deploy_info(p['repo_dir'] or p['container'])
     return items
 
+def save_project_monitors(c,project_id,ids):
+    if ids:
+        found={r['id'] for r in e.rows('SELECT id FROM monitors')}
+        if not set(ids)<=found: raise HTTPException(422,'Contrôle introuvable')
+    c.execute('DELETE FROM project_monitors WHERE project_id=?',(project_id,))
+    for mid in ids: c.execute('INSERT INTO project_monitors(project_id,monitor_id) VALUES (?,?)',(project_id,mid))
+
 @app.post('/api/projects')
 def create_project(body:Project):
     if len(e.rows('SELECT id FROM projects'))>=200: raise HTTPException(400,'Limite de 200 projets')
     with e.db() as c:
-        v=body.model_dump(); v['created']=time.time()
+        v=body.model_dump(exclude={'monitor_ids'}); v['created']=time.time()
         ident=c.execute('INSERT INTO projects('+','.join(v)+') VALUES ('+','.join('?' for _ in v)+')',tuple(v.values())).lastrowid
+        save_project_monitors(c,ident,body.monitor_ids)
     e.event('config','Projet ajouté : '+body.name); return {'id':ident}
 
 @app.put('/api/projects/{ident}')
 def update_project(ident:int,body:Project):
-    v=body.model_dump()
+    v=body.model_dump(exclude={'monitor_ids'})
     with e.db() as c:
         if not c.execute('UPDATE projects SET '+','.join(k+'=?' for k in v)+' WHERE id=?',(*v.values(),ident)).rowcount: raise HTTPException(404,'Projet introuvable')
+        save_project_monitors(c,ident,body.monitor_ids)
     return {'ok':True}
 
 @app.delete('/api/projects/{ident}')
@@ -469,6 +498,55 @@ def delete_project(ident:int):
     with e.db() as c:
         if not c.execute('DELETE FROM projects WHERE id=?',(ident,)).rowcount: raise HTTPException(404,'Projet introuvable')
     return {'ok':True}
+
+
+@app.get('/api/database')
+def database_info():
+    start=time.monotonic()
+    with e.db() as c:
+        c.execute('SELECT 1').fetchone()
+        counts={table:c.execute('SELECT COUNT(*) AS n FROM '+table).fetchone()['n'] for table in
+                ('monitors','projects','checks','samples','incidents','notification_jobs')}
+        if e.MARIA:
+            status={v['Variable_name']:v['Value'] for v in c.execute(
+                "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Slow_queries','Questions','Uptime')").fetchall()}
+            backend={'engine':'MariaDB/MySQL','size_bytes':None,'status':status}
+        else:
+            backend={'engine':'SQLite','size_bytes':e.DB.stat().st_size if e.DB.exists() else 0,'status':{'journal_mode':'WAL'}}
+    return {**backend,'ok':True,'latency_ms':round((time.monotonic()-start)*1000,1),'rows':counts}
+
+@app.get('/api/containers/{name}/logs')
+def container_logs(name:str,tail:int=100):
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}',name): raise HTTPException(422,'Nom invalide')
+    if not 1<=tail<=500: raise HTTPException(422,'Limite de 1 à 500 lignes')
+    with e.LOCK: allowed={c['name'] for c in e.CACHE.get('containers',[])}
+    if name not in allowed: raise HTTPException(404,'Conteneur introuvable')
+    try:
+        p=e.subprocess.run(['docker','logs','--tail',str(tail),'--timestamps',name],capture_output=True,text=True,timeout=12)
+        if p.returncode: raise RuntimeError('Docker unavailable')
+        logs=(p.stdout+'\n'+p.stderr)[-30000:]
+    except Exception: raise HTTPException(503,'Logs Docker indisponibles')
+    return {'name':name,'logs':logs}
+
+@app.get('/api/sla')
+def sla(days:int=30):
+    if days not in (1,7,30,90): raise HTTPException(422,'Période invalide')
+    now=time.time(); cutoff=now-days*86400
+    result=[]
+    for m in e.rows('SELECT id,name,`interval`,paused FROM monitors ORDER BY name'):
+        checks=e.rows('SELECT ts,ok FROM checks WHERE monitor_id=? AND ts>=? ORDER BY ts',(m['id'],cutoff))
+        up=down=0.
+        for i,c in enumerate(checks):
+            end=checks[i+1]['ts'] if i+1<len(checks) else now
+            seconds=max(0,min(end-c['ts'],m['interval']*2,now-c['ts']))
+            if c['ok']: up+=seconds
+            else: down+=seconds
+        observed=up+down
+        result.append({'id':m['id'],'name':m['name'],'observed_seconds':round(observed),
+            'up_seconds':round(up),'down_seconds':round(down),
+            'availability':round(up/observed*100,3) if observed else None,
+            'coverage':round(observed/(days*86400)*100,2),'paused':bool(m['paused'])})
+    return {'days':days,'monitors':result}
 
 @app.get('/api/discover')
 def discover():
@@ -479,6 +557,9 @@ def discover():
 
 @app.get('/')
 def index(): return FileResponse(ROOT/'static/index.html')
+@app.get('/sw.js')
+def service_worker(): return FileResponse(ROOT/'static/sw.js',media_type='application/javascript',headers={'Service-Worker-Allowed':'/'})
+
 @app.get('/status')
 def status_page(): return FileResponse(ROOT/'static/status.html')
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')

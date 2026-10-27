@@ -51,7 +51,7 @@ Accès réservé à un administrateur : mot de passe haché (PBKDF2), session pa
 - `monitor-docker-proxy` : liste des conteneurs, images, volumes et statistiques **en lecture seule**, publiée uniquement sur `127.0.0.1` ;
 - `monitor-bridge` : relie Caddy au socket Unix de l'application.
 
-Le serveur web (Caddy) publie `https://monitor.clubika.com` vers `monitor-bridge:8000`. Mises à jour : `deploy/update.sh` (copie, dépendances, redémarrage, test de santé) ; le déploiement automatique du serveur l'exécute à chaque commit sur `main`.
+Le reverse proxy (Caddy, Traefik, Nginx…) se connecte au réseau Docker `monitor_proxy` par défaut (créé automatiquement par `deploy/install.sh`) et transmet vers `monitor-bridge:8000`. Exemple pour Caddy dans un autre conteneur : `docker network connect monitor_proxy NOM_DU_CONTENEUR_CADDY`, puis `reverse_proxy monitor-bridge:8000`. **L'installation ne suppose plus de réseau `clubika_internal`**, de domaine ou de conteneur de proxy prédéfini. Ce raccordement au proxy reste une étape à configurer selon le serveur. Mises à jour : `deploy/update.sh` (copie, dépendances, redémarrage, test de santé) ; le déploiement automatique du serveur l'exécute à chaque commit sur `main`.
 
 ## Développement
 
@@ -66,3 +66,26 @@ MONITOR_DATA=./data MONITOR_SECURE_COOKIE=0 MONITOR_ORIGIN=http://127.0.0.1:8000
 - `collector_runtime.py` et `host_collectors.py` : ordonnancement borné et collecteurs optionnels ; `inventory_store.py` : historique et migration ; `software_inventory.py` et `docker_topology.py` : adaptateurs spécialisés.
 - Les tests MariaDB réels nécessitent `MONITOR_MARIADB_TEST_SOCKET` pointant explicitement vers une instance **isolée** : ils créent et retirent une base de test aléatoire. Ils n'utilisent pas `MONITOR_DB` et refusent les chemins de sockets de production habituels.
 - Le test navigateur facultatif `tests/e2e_inventory.py` utilise un Chromium et Playwright déjà installés, avec `MONITOR_BROWSER_URL`, `MONITOR_BROWSER_DATA` et `MONITOR_BROWSER_ARTIFACTS` dédiés à une instance locale de test. Aucun téléchargement de navigateur automatique.
+
+## Fiabilité des alertes
+
+Les envois Telegram, webhook et SMTP (STARTTLS ou TLS direct/465) sont enregistrés dans `notification_jobs` avant transmission. En cas d'échec, chaque canal est retenté avec un délai croissant (8 essais maximum), même après redémarrage. Les livraisons sont consultables via `/api/notifications/deliveries` (authentifié). Le contrôle `/healthz` renvoie HTTP 503 si les métriques sont anciennes ou si une capacité attendue Docker/systemd échoue. Un outil facultatif absent dès le démarrage est signalé comme dégradé avec HTTP 200, afin de permettre les installations sans cet outil. Un contrôle **hors du VPS** est indispensable pour détecter l'arrêt complet de la machine.
+
+Les conteneurs arrêtés, en redémarrage, marqués unhealthy ou OOM déclenchent des incidents dédiés. Évitez de maintenir des conteneurs volontairement arrêtés sans maintenance lorsque les alertes Docker sont actives.
+
+
+## Supervision applicative et diagnostics
+
+Les projets peuvent être reliés explicitement à plusieurs contrôles. Les associations implicites anciennes continuent de fonctionner lorsqu'aucune association explicite n'a été définie. Les pages **Rapports de disponibilité** (1, 7, 30, 90 jours) et **Base de données** exposent la couverture temporelle et les principales statistiques sans identifiants. Les logs Docker sont accessibles aux administrateurs dans la page Conteneurs (maximum 500 lignes, résultat borné). La PWA conserve uniquement les ressources statiques, jamais les API ou les sessions.
+
+## Sauvegardes programmées et restauration
+
+`deploy/install.sh` installe aussi `monitor-backup.timer` (sauvegarde quotidienne vers `/var/lib/monitor/backups`, permissions 0600, conservation 14 jours par défaut via `MONITOR_BACKUP_RETENTION_DAYS`). SQLite utilise `sqlite3.Connection.backup()`. MariaDB requiert **`mariadb-dump` ou `mysqldump` présent sur le serveur** ; sinon le job échoue (visible dans systemd). Les données sauvegardées contiennent des secrets : conserver ces archives privées, tester la restauration et répliquer hors VPS pour protéger contre une panne du disque. Pour restaurer, arrêter Monitor, prendre une copie de la base actuelle, puis exécuter `python backup_util.py restore CHEMIN --confirm`. En SQLite, déplacer la base existante hors du dossier avant la restauration.
+
+## Sonde extérieure indépendante
+
+Pour détecter un VPS complètement arrêté, faire exécuter `tools/external_watch.py` **sur une autre machine**. Une GitHub Actions facultative tourne toutes les 5 min : créer la variable de dépôt `MONITOR_EXTERNAL_ENABLED=true`, ainsi que les secrets `MONITOR_HEALTH_URL=https://votre-domaine/healthz`, `MONITOR_TELEGRAM_TOKEN` et `MONITOR_TELEGRAM_CHAT_ID`. Par défaut elle est désactivée et n'impose ni domaine ni fournisseur. Les alertes peuvent se répéter toutes les cinq minutes pendant une panne.
+
+## Portabilité
+
+L’application nécessite Linux et Python ; les collecteurs Docker/systemd restent optionnels. Le mode de déploiement fourni utilise systemd et une passerelle Docker. L'application ne dépend pas d'OVH ni d'un domaine particulier. Le réseau Docker de la passerelle est créé automatiquement par `deploy/install.sh` (`monitor_proxy` ou `MONITOR_PROXY_NETWORK`). Sur une installation existante, le script conserve le réseau actuel de `monitor-bridge` pour éviter de déconnecter Caddy. Lancer Compose manuellement nécessite de créer le réseau externe au préalable. Brancher explicitement le conteneur du reverse proxy sur ce réseau et router vers `monitor-bridge:8000`. L'hébergement HTTPS et son domaine restent à configurer selon le serveur.

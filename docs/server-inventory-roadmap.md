@@ -160,3 +160,17 @@ sauvegarde sans autorisation.
   applicative ni un accès avéré à une base.
 - Les métriques par interface, par service et par volume nécessitent encore des
   séries dédiées, des unités et des agrégations adaptées.
+
+## Intégration avec les évolutions de main
+
+La livraison conserve également les notifications persistantes, les diagnostics
+SLA/base, les relations explicites projets/contrôles, les utilitaires de sauvegarde
+et la PWA ajoutés sur main pendant ce travail. Les alertes Docker sont exécutées
+par le travailleur de persistance, sans bloquer les collecteurs. Une inspection
+inconnue ne clôture pas une alerte existante. La santé HTTP distingue un outil
+facultatif absent dès le démarrage d'une capacité attendue réellement en échec.
+
+Validation de l'ensemble fusionné : 98 tests Python, 17 tests JavaScript et un
+parcours Chromium ordinateur/mobile réussis ; une revue indépendante de la fusion
+ne relève pas de défaut matériel restant. La publication et le déploiement ont
+été autorisés explicitement par le propriétaire après préparation de la sauvegarde.

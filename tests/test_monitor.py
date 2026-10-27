@@ -31,8 +31,8 @@ def client():
     # This suite runs real collectors, but must never notify third parties or
     # send probes to a hostname merely used as a CRUD fixture.
     e = importlib.import_module('engine')
-    original_notify, original_check = e.notify, e.check
-    e.notify = lambda *args, **kwargs: None
+    original_notify, original_check = e.send_notification, e.check
+    e.send_notification = lambda *args, **kwargs: True
     def local_check(m):
         if m['kind'] in {'http','keyword','json','tls','dns','ping'}:
             return False, 0, 'External network disabled in tests', None
@@ -44,7 +44,7 @@ def client():
         creds = (c.engine.DATA / 'admin-credentials.txt').read_text()
         c.password = [line.split(': ', 1)[1] for line in creds.splitlines() if line.startswith('Mot de passe')][0]
         yield c
-    e.notify, e.check = original_notify, original_check
+    e.send_notification, e.check = original_notify, original_check
 
 
 def login(client):
@@ -239,3 +239,64 @@ def test_system_info_has_storage_and_network_details(client):
     info = client.engine.CACHE['system']
     assert info['filesystems'] and all({'mount', 'fstype', 'total', 'percent'} <= set(f) for f in info['filesystems'])
     assert isinstance(info['disk_io'], list) and isinstance(info['block_devices'], list)
+
+
+def test_durable_notification_queue_and_delivery(client, monkeypatch):
+    e=client.engine
+    monkeypatch.setattr(e,'send_notification',lambda channel,title,message: True)
+    before=e.rows('SELECT COUNT(*) AS n FROM notification_jobs')[0]['n']
+    with e.db() as c:
+        c.execute("UPDATE settings SET value=? WHERE `key`='webhook_url'", ('"https://example.org/hooks"',))
+    assert e.enqueue_notification('Test durable','Message') >= 1
+    jobs=e.rows('SELECT * FROM notification_jobs ORDER BY id DESC LIMIT 1')
+    assert len(jobs)==1 and jobs[0]['status']=='pending'
+    # With a live worker, a job transitions from pending to sent.
+    deadline=time.time()+8
+    while time.time()<deadline:
+        if e.rows('SELECT status FROM notification_jobs WHERE id=?',(jobs[0]['id'],))[0]['status']=='sent': break
+        time.sleep(.2)
+    assert e.rows('SELECT status FROM notification_jobs WHERE id=?',(jobs[0]['id'],))[0]['status']=='sent'
+    with e.db() as c: c.execute("UPDATE settings SET value=? WHERE `key`='webhook_url'", ('""',))
+
+
+def test_health_detects_stale_samples(client):
+    login(client)
+    e=client.engine
+    with e.LOCK:
+        original=e.LIVE.get('ts',0)
+        e.LIVE['ts']=time.time()-60
+        assert client.get('/healthz').status_code==503
+        e.LIVE['ts']=original
+
+def test_project_link_sla_and_database(client):
+    login(client)
+    mid=client.post('/api/monitors',json={'name':'Link','kind':'tcp','target':'127.0.0.1:1'},headers=HEADERS).json()['id']
+    created=client.post('/api/projects',json={'name':'Explicit','monitor_ids':[mid]},headers=HEADERS)
+    assert created.status_code==200,created.text
+    p=next(x for x in client.get('/api/projects').json() if x['id']==created.json()['id'])
+    assert p['monitor_ids']==[mid]
+    assert p['monitors'][0]['id']==mid
+    assert client.get('/api/database').json()['ok']
+    assert client.get('/api/sla?days=30').json()['days']==30
+    assert client.get('/api/sla?days=3').status_code==422
+    assert client.get('/api/containers/unknown-name/logs').status_code==404
+
+def test_sqlite_scheduled_backup(client):
+    import importlib, sqlite3
+    e=client.engine
+    if e.MARIA: pytest.skip('SQLite-specific test')
+    backup=importlib.import_module('backup_util')
+    p=backup.backup()
+    assert p.exists() and p.stat().st_size>100
+    assert p.stat().st_mode & 0o077==0
+    with sqlite3.connect(p) as c:
+        assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+        assert c.execute('SELECT COUNT(*) FROM monitors').fetchone()[0]>=1
+
+
+def test_external_watchdog_reports_a_down_server(monkeypatch):
+    import importlib, urllib.error
+    module=importlib.import_module('tools.external_watch')
+    def offline(*args,**kwargs): raise urllib.error.URLError('offline')
+    monkeypatch.setattr(module.urllib.request,'urlopen',offline)
+    assert module.check('https://monitor.example.com/healthz') is False

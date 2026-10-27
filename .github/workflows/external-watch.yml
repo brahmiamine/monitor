@@ -1,0 +1,20 @@
+name: External VPS Watchdog
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  monitor:
+    if: ${{ vars.MONITOR_EXTERNAL_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe health from outside
+        env:
+          MONITOR_HEALTH_URL: ${{ secrets.MONITOR_HEALTH_URL }}
+          MONITOR_TELEGRAM_TOKEN: ${{ secrets.MONITOR_TELEGRAM_TOKEN }}
+          MONITOR_TELEGRAM_CHAT_ID: ${{ secrets.MONITOR_TELEGRAM_CHAT_ID }}
+        run: python tools/external_watch.py
