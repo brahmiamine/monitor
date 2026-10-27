@@ -77,8 +77,10 @@ def test_login_rejects_bad_password_and_protects_writes(client):
 def test_default_monitors_are_seeded_once(client):
     login(client)
     monitors = client.get('/api/monitors').json()
-    names = {m['name'] for m in monitors}
-    assert 'SSH' in names  # surveillance de départ générique : aucun nom propre à un serveur
+    # SSH and Docker are optional: an empty inventory is valid on CI runners.
+    # Explicit SSH detection and absence are covered in test_inventory_api.py.
+    client.module.seed_monitors()
+    assert {m['id'] for m in client.get('/api/monitors').json()} == {m['id'] for m in monitors}
     assert len(monitors) == len({m['id'] for m in monitors})
 
 
