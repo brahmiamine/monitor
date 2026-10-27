@@ -15,6 +15,7 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: python -m compileall -q app.py engine.py backup_util.py tools
       - run: python -m pytest tests -q
+      - run: bash -n deploy/update.sh deploy/install.sh && test -x deploy/update.sh && test -x deploy/install.sh
       - uses: actions/setup-node@v4
         with: { node-version: 24 }
       - run: node --check static/app.js && node --check static/inventory.js && node --check static/status.js && node --check static/sw.js
