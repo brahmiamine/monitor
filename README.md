@@ -59,3 +59,19 @@ Les envois Telegram, webhook et SMTP (STARTTLS ou TLS direct/465) sont enregistr
 
 Les conteneurs arrêtés, en redémarrage, marqués unhealthy ou OOM déclenchent des incidents dédiés. Évitez de maintenir des conteneurs volontairement arrêtés sans maintenance lorsque les alertes Docker sont actives.
 
+
+## Supervision applicative et diagnostics
+
+Les projets peuvent être reliés explicitement à plusieurs contrôles. Les associations implicites anciennes continuent de fonctionner lorsqu'aucune association explicite n'a été définie. Les pages **Rapports de disponibilité** (1, 7, 30, 90 jours) et **Base de données** exposent la couverture temporelle et les principales statistiques sans identifiants. Les logs Docker sont accessibles aux administrateurs dans la page Conteneurs (maximum 500 lignes, résultat borné). La PWA conserve uniquement les ressources statiques, jamais les API ou les sessions.
+
+## Sauvegardes programmées et restauration
+
+`deploy/install.sh` installe aussi `monitor-backup.timer` (sauvegarde quotidienne vers `/var/lib/monitor/backups`, permissions 0600, conservation 14 jours par défaut via `MONITOR_BACKUP_RETENTION_DAYS`). SQLite utilise `sqlite3.Connection.backup()`. MariaDB requiert **`mariadb-dump` ou `mysqldump` présent sur le serveur** ; sinon le job échoue (visible dans systemd). Les données sauvegardées contiennent des secrets : conserver ces archives privées, tester la restauration et répliquer hors VPS pour protéger contre une panne du disque. Pour restaurer, arrêter Monitor, prendre une copie de la base actuelle, puis exécuter `python backup_util.py restore CHEMIN --confirm`. En SQLite, déplacer la base existante hors du dossier avant la restauration.
+
+## Sonde extérieure indépendante
+
+Pour détecter un VPS complètement arrêté, faire exécuter `tools/external_watch.py` **sur une autre machine**. Une GitHub Actions facultative tourne toutes les 5 min : créer la variable de dépôt `MONITOR_EXTERNAL_ENABLED=true`, ainsi que les secrets `MONITOR_HEALTH_URL=https://votre-domaine/healthz`, `MONITOR_TELEGRAM_TOKEN` et `MONITOR_TELEGRAM_CHAT_ID`. Par défaut elle est désactivée et n'impose ni domaine ni fournisseur. Les alertes peuvent se répéter toutes les cinq minutes pendant une panne.
+
+## Portabilité
+
+Nécessite Linux, systemd, Docker et Python. L'application ne dépend pas d'OVH ni d'un domaine particulier. Le réseau Docker de la passerelle est créé automatiquement (`monitor_proxy`, ou `MONITOR_PROXY_NETWORK` lors de la commande Docker Compose). Brancher explicitement le conteneur du reverse proxy sur ce réseau et router vers `monitor-bridge:8000`. L'hébergement HTTPS et son domaine restent à configurer selon le serveur.

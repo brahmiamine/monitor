@@ -14,8 +14,11 @@ sudo install -d -o "$(id -un)" -m 0755 /opt/monitor/deploy-state   # lisible par
 "$REPO/deploy/update.sh" --no-restart
 [ -f /etc/monitor.env ] || sudo install -m 0640 -o root -g monitor "$REPO/deploy/monitor.env.example" /etc/monitor.env
 sudo cp "$REPO/deploy/monitor.service" /etc/systemd/system/monitor.service
+sudo cp "$REPO/deploy/monitor-backup.service" /etc/systemd/system/monitor-backup.service
+sudo cp "$REPO/deploy/monitor-backup.timer" /etc/systemd/system/monitor-backup.timer
 sudo systemctl daemon-reload
 (cd "$REPO/deploy" && docker compose up -d)
 sudo systemctl enable --now monitor.service
+sudo systemctl enable --now monitor-backup.timer
 sudo systemctl restart monitor.service
 echo "Monitor installé. Identifiants initiaux : sudo cat /var/lib/monitor/admin-credentials.txt"
