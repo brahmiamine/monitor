@@ -394,4 +394,4 @@ try { const t = localStorage.getItem('theme') || (matchMedia('(prefers-color-sch
 window.addEventListener('hashchange', go);
 decorate(); start();
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/static/sw.js').catch(()=>{});
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(()=>{});
