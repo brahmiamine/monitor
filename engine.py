@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY,name TEXT NOT NULL,ur
 CREATE TABLE IF NOT EXISTS notification_jobs(id INTEGER PRIMARY KEY,channel TEXT NOT NULL,title TEXT NOT NULL,message TEXT NOT NULL,
   created REAL NOT NULL,due REAL NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'pending',last_error TEXT DEFAULT '');
 CREATE INDEX IF NOT EXISTS notification_due ON notification_jobs(status,due);
+CREATE TABLE IF NOT EXISTS project_monitors(project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+ monitor_id INTEGER NOT NULL REFERENCES monitors(id) ON DELETE CASCADE,PRIMARY KEY(project_id,monitor_id));
 '''
 MARIA_SCHEMA = [
  "CREATE TABLE IF NOT EXISTS settings(`key` VARCHAR(64) PRIMARY KEY,value MEDIUMTEXT NOT NULL)",
@@ -108,6 +110,9 @@ MARIA_SCHEMA = [
  "CREATE TABLE IF NOT EXISTS notification_jobs(id BIGINT AUTO_INCREMENT PRIMARY KEY,channel VARCHAR(24) NOT NULL,title VARCHAR(255) NOT NULL,"
  "message TEXT NOT NULL,created DOUBLE NOT NULL,due DOUBLE NOT NULL,attempts INT NOT NULL DEFAULT 0,status VARCHAR(16) NOT NULL DEFAULT 'pending',"
  "last_error VARCHAR(120) NOT NULL DEFAULT '',KEY notification_due(status,due))",
+ "CREATE TABLE IF NOT EXISTS project_monitors(project_id INT NOT NULL,monitor_id INT NOT NULL,PRIMARY KEY(project_id,monitor_id),"
+ "CONSTRAINT project_monitor_p_fk FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,"
+ "CONSTRAINT project_monitor_m_fk FOREIGN KEY(monitor_id) REFERENCES monitors(id) ON DELETE CASCADE)",
 ]
 
 def init():

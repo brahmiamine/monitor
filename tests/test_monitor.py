@@ -256,3 +256,16 @@ def test_health_detects_stale_samples(client):
         e.LIVE['ts']=time.time()-60
         assert client.get('/healthz').status_code==503
         e.LIVE['ts']=original
+
+def test_project_link_sla_and_database(client):
+    login(client)
+    mid=client.post('/api/monitors',json={'name':'Link','kind':'tcp','target':'127.0.0.1:1'},headers=HEADERS).json()['id']
+    created=client.post('/api/projects',json={'name':'Explicit','monitor_ids':[mid]},headers=HEADERS)
+    assert created.status_code==200,created.text
+    p=next(x for x in client.get('/api/projects').json() if x['id']==created.json()['id'])
+    assert p['monitor_ids']==[mid]
+    assert p['monitors'][0]['id']==mid
+    assert client.get('/api/database').json()['ok']
+    assert client.get('/api/sla?days=30').json()['days']==30
+    assert client.get('/api/sla?days=3').status_code==422
+    assert client.get('/api/containers/unknown-name/logs').status_code==404
