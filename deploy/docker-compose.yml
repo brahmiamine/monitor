@@ -17,6 +17,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
       - "127.0.0.1:2375:2375"
+    logging:   # ce proxy journalise chaque requête : sans rotation, le journal dépassait 1,7 Go
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
 
   bridge:
     image: alpine/socat:1.8.1.1
