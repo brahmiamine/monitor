@@ -26,7 +26,7 @@ def test_inventory_desktop_mobile_and_history():
     output=Path(artifacts);output.mkdir(parents=True,exist_ok=True)
     password=next(line.split(': ',1)[1] for line in (folder/'admin-credentials.txt').read_text().splitlines() if line.startswith('Mot de passe'))
     with pw.sync_playwright() as p:
-        browser=p.chromium.launch(headless=True,executable_path='/usr/bin/chromium',args=['--disable-dev-shm-usage'])
+        browser=p.chromium.launch(headless=True,executable_path=os.environ.get('MONITOR_BROWSER_EXECUTABLE') or None,args=['--disable-dev-shm-usage'])
         page=browser.new_page(viewport={'width':1440,'height':1000})
         errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
         page.goto(url)

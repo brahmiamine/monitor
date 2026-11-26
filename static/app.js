@@ -22,12 +22,22 @@ const ICONS = {
   package: '<path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/>',
   folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
   cpu: '<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9"/><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/>',
+  chart: '<path d="M3 3v18h18"/><path d="M8 17v-5M13 17V8M18 17v-8"/>',
+  database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
+  journal: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h8"/>',
   external: '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
   github: '<path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"/><path d="M9 18c-4.51 2-5-2-7-2"/>',
   alert: '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4M12 17h.01"/>',
 };
 const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ''}</svg>`;
-const decorate = (root = document) => $$('[data-icon]', root).forEach((el) => { if (!el.querySelector(':scope > svg.icon')) el.insertAdjacentHTML('afterbegin', icon(el.dataset.icon)); });
+function decorate(root = document) {
+  $$('[data-icon]', root).forEach((el) => { if (!el.querySelector(':scope > svg.icon')) el.insertAdjacentHTML('afterbegin', icon(el.dataset.icon)); });
+  $$('.data-table', root).forEach((t) => {
+    const heads = $$('thead th', t).map((th) => th.textContent.trim()); if (heads.length < 3) return;
+    t.classList.add('cards');
+    $$('tbody tr', t).forEach((tr) => [...tr.children].forEach((td, i) => { if (heads[i] && td.colSpan === 1) td.dataset.label = heads[i]; }));
+  });
+}
 
 // ---------- Formats ----------
 const UNITS = ['o', 'Ko', 'Mo', 'Go', 'To'];
@@ -59,17 +69,17 @@ function toast(message, bad = false) {
 // ---------- Graphiques SVG ----------
 const niceMax = (v) => { if (v <= 0) return 1; const p = 10 ** Math.floor(Math.log10(v)); return [1, 2, 5, 10].map((m) => m * p).find((m) => m >= v); };
 function chart(series, { max, fmt = (v) => v, height = 220 } = {}) {
-  const W = 640, H = height, L = 52, R = 10, T = 10, B = 24;
+  const W = innerWidth < 600 ? 360 : 640, H = height, L = 52, R = 10, T = 10, B = 24;
   const pts = series.flatMap((s) => s.values);
   if (pts.length < 2) return '<div class="empty">Pas encore assez de mesures pour tracer la courbe.</div>';
   const t0 = Math.min(...pts.map((p) => p[0])), t1 = Math.max(...pts.map((p) => p[0]));
   const top = max ?? niceMax(Math.max(...pts.map((p) => p[1] ?? 0)) * 1.1);
   const x = (t) => L + ((t - t0) / Math.max(1, t1 - t0)) * (W - L - R), y = (v) => T + (1 - Math.min(v, top) / top) * (H - T - B);
   const grid = [0, .25, .5, .75, 1].map((f) => `<line class="grid-line" x1="${L}" x2="${W - R}" y1="${y(top * f)}" y2="${y(top * f)}"/><text x="${L - 8}" y="${y(top * f) + 3}" text-anchor="end">${esc(fmt(top * f))}</text>`).join('');
-  const labels = [0, .5, 1].map((f) => `<text x="${x(t0 + (t1 - t0) * f)}" y="${H - 6}" text-anchor="${f === 0 ? 'start' : f === 1 ? 'end' : 'middle'}">${clock(t0 + (t1 - t0) * f)}</text>`).join('');
+  const labels = (t1 - t0 < 180 ? [1] : [0, .5, 1]).map((f) => `<text x="${x(t0 + (t1 - t0) * f)}" y="${H - 6}" text-anchor="${f === 0 ? 'start' : f === 1 ? 'end' : 'middle'}">${clock(t0 + (t1 - t0) * f)}</text>`).join('');
   const lines = series.map((s, i) => {
     const d = s.values.filter((p) => p[1] != null).map((p, j) => `${j ? 'L' : 'M'}${x(p[0]).toFixed(1)} ${y(p[1]).toFixed(1)}`).join('');
-    const area = i === 0 && d ? `<path class="area" d="${d}L${x(t1)} ${y(0)}L${x(t0)} ${y(0)}Z" opacity=".55"/>` : '';
+    const area = i === 0 && d ? `<path class="area" d="${d}L${x(t1)} ${y(0)}L${x(t0)} ${y(0)}Z"/>` : '';
     return area + `<path class="plot ${i ? 'secondary' : ''}" d="${d}"/>`;
   }).join('');
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${esc(series.map((s) => s.name).join(', '))}" style="height:${height}px">${grid}${lines}${labels}</svg>`;
@@ -106,24 +116,30 @@ const PAGES = {
     const root = l.disks?.find((d) => d.mount === '/') || l.disks?.[0] || {};
     const apps = S.monitors.filter((m) => m.group_name === 'Applications');
     const running = (l.containers || []).filter((c) => c.state === 'running').length;
-    return `<div class="health-strip ${down.length || open.length ? 'warning' : ''}"><span class="health-symbol">${icon(down.length || open.length ? 'alert' : 'check')}</span><div><h2>${down.length ? `${down.length} contrôle(s) hors ligne` : open.length ? `${open.length} incident(s) ouvert(s)` : 'Tout fonctionne normalement'}</h2><p>${S.monitors.length} contrôles · ${running}/${(l.containers || []).length} conteneurs actifs · ${esc(l.hostname || '')} en ligne depuis ${dur(l.uptime)}</p></div><span class="right">Dernière mesure ${clock(l.ts)}</span></div>
+    const bad = down.length || open.length;
+    const metric = (label, value, note, extra = '') => `<div class="metric"><div class="metric-label">${label}</div>${value}<div class="metric-note">${note}</div>${extra}</div>`;
+    const big = (v) => `<div class="metric-value">${(v ?? 0).toFixed(1)}<small> %</small></div>`;
+    const tile = (m) => `<button class="tile ${!m.paused && m.ok === 0 ? 'is-down' : ''}" data-detail="${m.id}">${monitorBadge(m)}<strong>${esc(m.name)}</strong><small>${m.latency != null ? Math.round(m.latency) + ' ms · ' : ''}${m.uptime != null ? m.uptime + ' % sur 24 h' : 'en attente'}</small></button>`;
+    const shown = [...apps].sort((a, b) => (a.ok === 0 ? 0 : 1) - (b.ok === 0 ? 0 : 1));
+    return `<div class="health-strip ${bad ? 'warning' : ''}"><span class="health-symbol">${icon(bad ? 'alert' : 'check')}</span><div><h2>${down.length ? `${down.length} contrôle(s) hors ligne` : open.length ? `${open.length} incident(s) ouvert(s)` : 'Tout fonctionne normalement'}</h2><p>${S.monitors.length} contrôles · ${running}/${(l.containers || []).length} conteneurs actifs · ${esc(l.hostname || '')} en ligne depuis ${dur(l.uptime)}</p></div><span class="right">Dernière mesure ${clock(l.ts)}</span></div>
+    ${open.length ? panel('Incidents ouverts', `<div class="mini-list">${open.map((i) => `<div class="mini-row"><div><strong>${esc(i.title)}</strong><small>${esc(i.message)}</small></div><span class="right">${ago(i.opened)}</span></div>`).join('')}</div>`, { tag: '<a href="#incidents">Historique →</a>' }) + '<div style="height:16px"></div>' : ''}
     <div class="metric-grid">
-      <div class="metric"><div class="metric-label">Processeur</div><div class="metric-value">${l.cpu.toFixed(1)}<small> %</small></div><div class="metric-note">${l.cores.length} cœurs · charge ${l.load_avg.map((v) => v.toFixed(2)).join(' / ')}</div>${meter(l.cpu)}</div>
-      <div class="metric"><div class="metric-label">Mémoire</div><div class="metric-value">${l.ram.toFixed(1)}<small> %</small></div><div class="metric-note">${bytes(l.memory.used)} sur ${bytes(l.memory.total)}</div>${meter(l.ram)}</div>
-      <div class="metric"><div class="metric-label">Disque</div><div class="metric-value">${(root.percent ?? 0).toFixed(1)}<small> %</small></div><div class="metric-note">${bytes(root.used)} sur ${bytes(root.total)}</div>${meter(root.percent)}</div>
-      <div class="metric"><div class="metric-label">Réseau</div><div class="metric-value" style="font-size:19px">↓ ${rate(l.rx)}</div><div class="metric-note">↑ ${rate(l.tx)}</div></div></div>
+      ${metric('Processeur', big(l.cpu), `${l.cores.length} cœurs · charge ${l.load_avg.map((v) => v.toFixed(2)).join(' / ')}`, meter(l.cpu))}
+      ${metric('Mémoire', big(l.ram), `${bytes(l.memory.used)} sur ${bytes(l.memory.total)}`, meter(l.ram))}
+      ${metric('Disque', big(root.percent), `${bytes(root.used)} sur ${bytes(root.total)}`, meter(root.percent))}
+      ${metric('Réseau', `<div class="metric-value net">↓ ${rate(l.rx)}</div>`, `↑ ${rate(l.tx)}`)}</div>
+    ${panel('Applications', shown.length ? `<div class="tile-grid">${shown.map(tile).join('')}</div>` : '<div class="empty">Aucune application surveillée.</div>', { tag: '<a href="#monitors">Tous les contrôles →</a>' })}
+    <div style="height:16px"></div>
     <div class="dashboard-grid">${panel('Processeur et mémoire', `<div class="chart-wrap">${chart([{ name: 'CPU', values: S.history.map((p) => [p.ts, p.cpu]) }, { name: 'Mémoire', values: S.history.map((p) => [p.ts, p.ram]) }], { max: 100, fmt: (v) => Math.round(v) + '%' })}</div>${legend('Processeur', 'Mémoire')}`, { note: 'Dernière heure' })}
-    ${panel('Applications', `<div class="mini-list">${apps.map((m) => `<div class="mini-row"><div><strong>${esc(m.name)}</strong><small>${m.latency != null ? Math.round(m.latency) + ' ms · ' : ''}${m.uptime != null ? m.uptime + ' % sur 24 h' : 'en attente'}</small></div><span class="right">${monitorBadge(m)}</span></div>`).join('') || '<div class="empty">Aucune application surveillée.</div>'}</div>`, { tag: '<a href="#monitors">Tout voir →</a>' })}</div>
-    <div class="split-grid">${panel('Conteneurs', `<div class="mini-list">${(l.containers || []).slice(0, 8).map((c) => `<div class="mini-row"><div><strong>${esc(c.name)}</strong><small>${esc(c.image)}</small></div><span class="right">${esc(c.cpu)} · ${esc(c.memory.split('/')[0])}</span></div>`).join('') || '<div class="empty">Aucun conteneur.</div>'}</div>`, { tag: '<a href="#containers">Tout voir →</a>' })}
-    ${panel('Incidents ouverts', `<div class="mini-list">${open.map((i) => `<div class="mini-row"><div><strong>${esc(i.title)}</strong><small>${esc(i.message)}</small></div><span class="right">${ago(i.opened)}</span></div>`).join('') || '<div class="empty">Aucun incident. Rien à signaler.</div>'}</div>`, { tag: '<a href="#incidents">Historique →</a>' })}</div>`;
+    ${panel('Conteneurs', `<div class="mini-list">${(l.containers || []).slice(0, 6).map((c) => `<div class="mini-row"><div><strong>${esc(c.name)}</strong><small>${esc(c.image)}</small></div><span class="right">${esc(c.cpu)} · ${esc(c.memory.split('/')[0])}</span></div>`).join('') || '<div class="empty">Aucun conteneur.</div>'}</div>`, { tag: '<a href="#containers">Tout voir →</a>' })}</div>`;
   } },
 
-  server: { title: 'Serveur', desc: 'Processeur, mémoire, disques, réseau et processus de l’hôte.', live: true, render() {
+  server: { title: 'Mesures du serveur', desc: 'Processeur, mémoire, disques, réseau et processus de l’hôte.', live: true, render() {
     const l = S.live; if (!l?.ts) return '<div class="empty">Chargement…</div>';
     const H = S.history, hours = [[1, '1 h'], [6, '6 h'], [24, '24 h'], [168, '7 j'], [720, '30 j']];
     const swap = l.swap || {};
     const sensors = Object.entries(l.sensors || {}).flatMap(([n, a]) => a.map((s) => `<div class="mini-row"><strong>${esc(n)} ${esc(s.label || '')}</strong><span class="right">${s.current} °C</span></div>`));
-    return `<div class="toolbar"><span class="muted" style="margin-left:0">Période des courbes</span>${hours.map(([h, t]) => `<button class="${S.hours === h ? 'primary' : ''}" data-hours="${h}">${t}</button>`).join('')}<a class="button-link" style="margin-left:auto" href="/api/export/metrics.csv?hours=${S.hours}">Exporter en CSV</a></div>
+    return `<div class="toolbar"><div class="segmented" role="group" aria-label="Période des courbes">${hours.map(([h, t]) => `<button class="${S.hours === h ? 'primary' : ''}" data-hours="${h}">${t}</button>`).join('')}</div><a class="button-link" href="/api/export/metrics.csv?hours=${S.hours}">Exporter en CSV</a></div>
     <div class="split-grid">${panel('Processeur', `<div class="chart-wrap">${chart([{ name: 'CPU', values: H.map((p) => [p.ts, p.cpu]) }], { max: 100, fmt: (v) => Math.round(v) + '%' })}</div>`, { note: `${l.cpu.toFixed(1)} % · utilisateur ${l.cpu_times.user} % · système ${l.cpu_times.system} %` })}
     ${panel('Charge moyenne', `<div class="chart-wrap">${chart([{ name: 'Charge', values: H.map((p) => [p.ts, p.load]) }], { fmt: (v) => v.toFixed(1) })}</div>`, { note: `1 / 5 / 15 min : ${l.load_avg.map((v) => v.toFixed(2)).join(' / ')}` })}
     ${panel('Mémoire', `<div class="chart-wrap">${chart([{ name: 'Mémoire', values: H.map((p) => [p.ts, p.ram]) }], { max: 100, fmt: (v) => Math.round(v) + '%' })}</div>`, { note: `${bytes(l.memory.used)} / ${bytes(l.memory.total)} · cache ${bytes(l.memory.cached || 0)} · swap ${bytes(swap.used)} / ${bytes(swap.total)}` })}
@@ -131,7 +147,7 @@ const PAGES = {
     ${panel('Entrées / sorties disque', `<div class="chart-wrap">${chart([{ name: 'Lecture', values: H.map((p) => [p.ts, p.read]) }, { name: 'Écriture', values: H.map((p) => [p.ts, p.write]) }], { fmt: (v) => bytes(v, 0) + '/s' })}</div>${legend('Lecture', 'Écriture')}`, { note: `lecture ${rate(l.read)} · écriture ${rate(l.write)}` })}
     ${panel('Occupation des disques', (l.disks || []).map((d) => `<div class="disk-item"><p><strong>${esc(d.mount)}</strong><small>${esc(d.device)} · ${esc(d.fstype)} · ${bytes(d.used)} / ${bytes(d.total)} (${d.percent} %)</small></p>${meter(d.percent)}</div>`).join(''), { note: 'Partitions réelles' })}</div>
     ${panel('Cœurs du processeur', `<div class="core-grid">${l.cores.map((c, i) => `<div><span>Cœur ${i + 1}<strong>${c.toFixed(0)} %</strong></span>${meter(c)}</div>`).join('')}</div>`)}
-    <div class="split-grid" style="margin-top:24px">${panel('Système', `<div class="spec-list"><div><span>Nom d’hôte</span><strong>${esc(l.hostname)}</strong></div><div><span>Système</span><strong>${esc(l.platform)}</strong></div><div><span>Démarré depuis</span><strong>${dur(l.uptime)}</strong></div><div><span>Connexions réseau</span><strong>${l.connections ?? '—'}</strong></div><div><span>Mémoire virtuelle (swap)</span><strong>${bytes(swap.used)} / ${bytes(swap.total)}</strong></div></div>${sensors.length ? `<div class="mini-list">${sensors.join('')}</div>` : ''}`)}
+    <div class="split-grid" style="margin-top:16px">${panel('Système', `<div class="spec-list"><div><span>Nom d’hôte</span><strong>${esc(l.hostname)}</strong></div><div><span>Système</span><strong>${esc(l.platform)}</strong></div><div><span>Démarré depuis</span><strong>${dur(l.uptime)}</strong></div><div><span>Connexions réseau</span><strong>${l.connections ?? '—'}</strong></div><div><span>Mémoire virtuelle (swap)</span><strong>${bytes(swap.used)} / ${bytes(swap.total)}</strong></div></div>${sensors.length ? `<div class="mini-list">${sensors.join('')}</div>` : ''}`)}
     ${panel('Interfaces réseau', `<div class="network-list">${(l.interfaces || []).map((n) => `<div class="mini-row"><strong>${esc(n.name)}</strong><span class="right">↓ ${bytes(n.bytes_recv)} · ↑ ${bytes(n.bytes_sent)} · erreurs ${n.errin + n.errout}</span></div>`).join('')}</div>`, { note: 'Compteurs cumulés depuis le démarrage' })}</div>
     ${panel('Processus les plus actifs', table(['PID', 'Nom', 'Utilisateur', 'CPU', 'Mémoire', 'État'], (l.processes || []).slice(0, 15).map((p) => `<tr><td>${p.pid}</td><td>${esc(p.name)}</td><td>${esc(p.username || '')}</td><td>${(p.cpu_percent || 0).toFixed(1)} %</td><td>${(p.memory_percent || 0).toFixed(1)} %</td><td>${esc(p.status)}</td></tr>`)), { note: 'Triés par CPU puis mémoire' })}`;
   } },
@@ -147,18 +163,21 @@ const PAGES = {
     S.projects = items;
     const safe = (u) => (/^https?:\/\//.test(u || '') ? u : '');
     const link = (href, label, ic) => (safe(href) ? `<a class="button-link" href="${esc(safe(href))}" target="_blank" rel="noopener noreferrer">${icon(ic)} ${label}</a>` : '');
+    const isDown = (p) => p.monitors.some((x) => !x.paused && x.ok === 0);
     const card = (p) => {
       const m = p.monitors[0], c = p.container_info, d = p.deploy;
       const rows = [
-        m ? `<div><span>Statut</span><strong>${monitorBadge(m)}</strong></div><div><span>Disponibilité 24 h</span><strong>${m.uptime != null ? m.uptime + ' %' : '—'}${m.latency != null ? ' · ' + Math.round(m.latency) + ' ms' : ''}</strong></div>` : '',
+        m ? `<div><span>Disponibilité 24 h</span><strong>${m.uptime != null ? m.uptime + ' %' : '—'}${m.latency != null ? ' · ' + Math.round(m.latency) + ' ms' : ''}</strong></div>` : '',
         m?.tls_days != null ? `<div><span>Certificat HTTPS</span><strong class="${m.tls_days < 14 ? 'bad' : ''}">${m.tls_days} jours</strong></div>` : '',
         c ? `<div><span>Conteneur ${esc(c.name)}</span><strong>${esc(c.state)} · CPU ${esc(c.cpu)} · ${esc(c.memory.split('/')[0])}</strong></div>` : '',
         d ? `<div><span>Dernier déploiement</span><strong>${esc(String(d.sha || '').slice(0, 7))} · ${ago(d.at)}</strong></div>` : '',
       ].join('');
-      return panel(p.name, `${p.description ? `<p class="form-help" style="padding:0 22px">${esc(p.description)}</p>` : ''}<div class="spec-list">${rows || '<div><span>Aucun contrôle ni conteneur rattaché</span><strong>—</strong></div>'}</div><div class="detail-actions" style="padding:0 22px 20px">${link(p.url, 'Ouvrir l’application', 'external')}${link(p.repo_url, 'Dépôt GitHub', 'github')}<button data-edit-project="${p.id}">Modifier</button><button class="danger" data-delete-project="${p.id}">Supprimer</button></div>`, { note: p.url ? p.url.replace(/^https?:\/\//, '') : '' });
+      const card = panel(p.name, `${p.description ? `<p class="form-help" style="padding:0 18px">${esc(p.description)}</p>` : ''}<div class="spec-list">${rows || '<div><span>Aucun contrôle ni conteneur rattaché</span><strong>—</strong></div>'}</div><div class="detail-actions">${link(p.url, 'Ouvrir l’application', 'external')}${link(p.repo_url, 'Dépôt GitHub', 'github')}<button data-edit-project="${p.id}">Modifier</button><button class="danger" data-delete-project="${p.id}">Supprimer</button></div>`, { note: p.url ? p.url.replace(/^https?:\/\//, '') : '', tag: m ? monitorBadge(m) : '' });
+      return isDown(p) ? card.replace('class="panel"', 'class="panel is-down"') : card;
     };
+    items.sort((a, b) => isDown(b) - isDown(a));
     const discovered = found.length ? panel('Détectés sur le serveur', table(['Conteneur', 'Image', 'Ports', ''], found.map((f) => `<tr><td><strong>${esc(f.name)}</strong></td><td>${esc(f.image)}</td><td class="log-message">${esc((f.ports || []).join(', ') || '—')}</td><td><button data-adopt="${esc(f.name)}">Ajouter comme projet</button></td></tr>`)), { note: 'Conteneurs qui ne sont rattachés à aucun projet' }) : '';
-    return `<div class="toolbar"><button class="primary" id="add-project">+ Ajouter un projet</button><span class="muted">${items.length} projet(s)</span></div><div class="split-grid">${items.map(card).join('') || '<div class="empty">Aucun projet. Ajoutez le premier, ou choisissez un conteneur détecté ci-dessous.</div>'}</div>${discovered}`;
+    return `<div class="toolbar"><button class="primary" id="add-project">+ Ajouter un projet</button><span class="muted">${items.length} projet(s)</span></div><div class="project-grid">${items.map(card).join('') || '<div class="empty">Aucun projet. Ajoutez le premier, ou choisissez un conteneur détecté ci-dessous.</div>'}</div>${discovered}`;
   } },
 
   system: { title: 'Système', desc: 'Toutes les informations disponibles sur le serveur et sa maintenance.', live: true, render() {
@@ -185,7 +204,7 @@ const PAGES = {
     const l = S.live; if (!l?.ts) return '<div class="empty">Chargement…</div>';
     if (l.errors?.containers) return `<div class="notice error">${esc(l.errors.containers)}</div>`;
     const since = (c) => (c.state === 'running' && c.started ? dur(Date.now() / 1000 - Date.parse(c.started) / 1000) : '—');
-    return panel('Conteneurs Docker', table(['Nom', 'Image', 'État', 'Santé', 'En ligne depuis', 'Redém.', 'Ports', 'CPU', 'Mémoire', 'Réseau', 'Disque', 'Logs'], (l.containers || []).map((c) => `<tr><td><strong>${esc(c.name)}</strong>${c.compose ? `<small>${esc(c.compose)}</small>` : ''}</td><td>${esc(c.image)}</td><td>${badge(c.state === 'running' ? '' : 'down', c.state)}</td><td>${c.health ? badge(c.health === 'healthy' ? '' : 'down', c.health) : '—'}</td><td>${since(c)}</td><td>${c.restarts ?? '—'}${c.oom ? ' · OOM' : ''}</td><td class="log-message">${esc((c.ports || []).join(', ') || '—')}</td><td>${esc(c.cpu)}</td><td>${esc(c.memory)}</td><td>${esc(c.network)}</td><td>${esc(c.io)}</td><td><button data-logs="${esc(c.name)}">Voir</button></td></tr>`), 'Aucun conteneur détecté.'), { note: 'Mesures selon la fréquence du collecteur ; fraîcheur détaillée dans Inventaire' });
+    return panel('Conteneurs Docker', table(['Nom', 'État', 'En ligne depuis', 'Redém.', 'CPU', 'Mémoire', 'Réseau et disque', 'Logs'], (l.containers || []).map((c) => `<tr><td><strong>${esc(c.name)}</strong><small>${esc([c.image, c.compose].filter(Boolean).join(' · '))}</small>${c.ports?.length ? `<small>${esc(c.ports.join(', '))}</small>` : ''}</td><td>${badge(c.state === 'running' ? '' : 'down', c.state)}${c.health ? ' ' + badge(c.health === 'healthy' ? '' : 'down', c.health) : ''}</td><td>${since(c)}</td><td>${c.restarts ?? '—'}${c.oom ? ' · OOM' : ''}</td><td>${esc(c.cpu)}</td><td>${esc(c.memory)}</td><td>${esc(c.network)}<small>${esc(c.io)}</small></td><td><button data-logs="${esc(c.name)}">Voir</button></td></tr>`), 'Aucun conteneur détecté.'), { note: 'Mesures selon la fréquence du collecteur ; fraîcheur détaillée dans Inventaire' });
   } },
 
   services: { title: 'Services système', desc: 'Services systemd en cours d’exécution sur le serveur.', live: true, render() {
@@ -196,11 +215,14 @@ const PAGES = {
       panel('Services', table(['Service', 'État', 'Détail', 'Mémoire', 'CPU cumulé'], list.map((s) => `<tr><td><strong>${esc(s.name)}</strong></td><td>${badge(s.active === 'active' ? '' : 'paused', s.active === 'active' ? 'actif' : 'inactif')}</td><td>${esc(s.description)}</td><td>${s.memory != null ? bytes(s.memory) : '—'}</td><td>${s.cpu_seconds != null ? dur(s.cpu_seconds) : '—'}</td></tr>`), 'Aucun service.'));
   } },
 
-  monitors: { title: 'Disponibilité', desc: 'Sites, applications, ports, conteneurs et certificats surveillés en continu.', render() {
-    const q = (S.q || '').toLowerCase(), list = S.monitors.filter((m) => (m.name + m.target + m.group_name).toLowerCase().includes(q));
+  monitors: { title: 'Contrôles', desc: 'Sites, applications, ports, conteneurs et certificats surveillés en continu.', render() {
+    const q = (S.q || '').toLowerCase(), only = S.state || 'all';
+    const states = { all: ['Tous', () => true], down: ['En panne', (m) => !m.paused && m.ok === 0], paused: ['En pause', (m) => !!m.paused] };
+    const list = S.monitors.filter((m) => states[only][1](m) && (m.name + m.target + m.group_name).toLowerCase().includes(q));
+    const tabs = `<div class="segmented" role="group" aria-label="Filtrer par état">${Object.entries(states).map(([k, [label, test]]) => `<button data-state="${k}" class="${only === k ? 'primary' : ''}" aria-pressed="${only === k}">${label} ${S.monitors.filter(test).length}</button>`).join('')}</div>`;
     const groups = [...new Set(list.map((m) => m.group_name))];
     const rows = groups.flatMap((g) => [`<tr><td colspan="8" class="group-label">${esc(g)}</td></tr>`, ...list.filter((m) => m.group_name === g).map((m) => `<tr><td><button class="name-button" data-detail="${m.id}">${esc(m.name)}</button><small>${esc(m.target)}</small></td><td>${esc(KIND[m.kind] || m.kind)}</td><td>${monitorBadge(m)}</td><td>${m.uptime != null ? m.uptime + ' %' : '—'}</td><td>${m.latency != null ? Math.round(m.latency) + ' ms' : '—'}</td><td>${m.tls_days != null ? `<span class="${m.tls_days < 14 ? 'bad' : ''}">${m.tls_days} j</span>` : '—'}</td><td>${ago(m.checked_at)}</td><td class="actions-cell"><button data-check="${m.id}">Vérifier</button><button data-pause="${m.id}">${m.paused ? 'Reprendre' : 'Pause'}</button></td></tr>`)]);
-    return `<div class="toolbar"><input id="filter" type="search" placeholder="Rechercher un contrôle…" value="${esc(S.q || '')}" aria-label="Rechercher"><button class="primary" id="add-monitor">+ Ajouter un contrôle</button><span class="muted">${list.length} contrôle(s)</span></div>` +
+    return `<div class="toolbar"><input id="filter" type="search" placeholder="Rechercher un contrôle…" value="${esc(S.q || '')}" aria-label="Rechercher">${tabs}<button class="primary" id="add-monitor">+ Ajouter un contrôle</button><span class="muted">${list.length} contrôle(s)</span></div>` +
       panel('Contrôles', table(['Nom', 'Type', 'Statut', 'Dispo. 24 h', 'Latence', 'Certificat', 'Dernier contrôle', ''], rows, 'Aucun contrôle. Ajoutez votre premier site ou service.'));
   } },
 
@@ -261,7 +283,7 @@ async function go() {
   S.page = PAGES[name] ? name : 'overview'; S.q = '';
   const p = PAGES[S.page];
   $('#page-title').textContent = p.title; $('#page-description').textContent = p.desc; $('#breadcrumb').textContent = p.title;
-  $$('nav a, .sidebar-bottom a').forEach((a) => a.classList.toggle('active', a.dataset.page === S.page));
+  $$('nav a, .sidebar-bottom>a').forEach((a) => a.classList.toggle('active', a.dataset.page === S.page));
   $('.sidebar').classList.remove('open');
   if (S.page === 'overview' || S.page === 'server') await loadHistory();
   render(); $('#main').focus({ preventScroll: true });
@@ -359,6 +381,7 @@ document.addEventListener('click', async (ev) => {
     else if (t.dataset.inventoryHistory) await showInventoryHistory(t.dataset.inventoryHistory);
     else if (t.dataset.manual) { S.manualOnly = !S.manualOnly; render(); }
     else if (t.dataset.hours) { S.hours = +t.dataset.hours; await loadHistory(); render(); }
+    else if (t.dataset.state) { S.state = t.dataset.state; render(); }
     else if (t.dataset.slaDays) { S.slaDays = +t.dataset.slaDays; render(); }
     else if (t.dataset.logs) { const data=await api('/api/containers/'+encodeURIComponent(t.dataset.logs)+'/logs?tail=150'); openDialog('Logs Docker : '+data.name, '<pre class="log-view">'+esc(data.logs)+'</pre>'); }
     else if (t.dataset.detail) await showDetail(+t.dataset.detail);
@@ -438,7 +461,11 @@ $('#login-form').addEventListener('submit', async (ev) => {
   catch (e) { $('#login-error').textContent = e.message; }
 });
 $('#logout').addEventListener('click', async () => { await api('/api/logout', { method: 'POST' }).catch(() => {}); showLogin(); });
-$('#menu').addEventListener('click', () => $('.sidebar').classList.toggle('open'));
+const toggleMenu = () => $('.sidebar').classList.toggle('open');
+$('#menu').addEventListener('click', toggleMenu);
+$('#menu-tab').addEventListener('click', toggleMenu);
+$('.scrim').addEventListener('click', toggleMenu);
+document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') $('.sidebar').classList.remove('open'); });
 $('#close-dialog').addEventListener('click', () => $('#dialog').close());
 $('#theme').addEventListener('click', () => { const dark = document.documentElement.dataset.theme !== 'dark'; document.documentElement.dataset.theme = dark ? 'dark' : 'light'; try { localStorage.setItem('theme', dark ? 'dark' : 'light'); } catch { /* facultatif */ } });
 try { const t = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); document.documentElement.dataset.theme = t; } catch { /* thème clair par défaut */ }
